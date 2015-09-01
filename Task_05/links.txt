@@ -1,0 +1,3 @@
+http://stackoverflow.com/questions/23307579/loading-module-on-keyboard-hotplug
+http://ubuntuforums.org/showthread.php?t=168221
+https://wiki.archlinux.org/index.php/Modalias#Where_does_this_modules.alias_file_come_from.3F

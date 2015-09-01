@@ -1,0 +1,202 @@
+Linux version 4.2.0-rc7-next-20150819+ (root@tux-vm) (gcc version 4.9.2 (Ubuntu 4.9.2-10ubuntu13) ) #4 Tue Aug 25 11:09:40 IST 2015
+Command line: ip=dhcp rd.shell=1 console=ttyS0
+x86/fpu: Legacy x87 FPU detected.
+x86/fpu: Using 'lazy' FPU context switches.
+e820: BIOS-provided physical RAM map:
+BIOS-e820: [mem 0x0000000000000000-0x000000000009fbff] usable
+BIOS-e820: [mem 0x000000000009fc00-0x000000000009ffff] reserved
+BIOS-e820: [mem 0x00000000000f0000-0x00000000000fffff] reserved
+BIOS-e820: [mem 0x0000000000100000-0x0000000007fdffff] usable
+BIOS-e820: [mem 0x0000000007fe0000-0x0000000007ffffff] reserved
+BIOS-e820: [mem 0x00000000feffc000-0x00000000feffffff] reserved
+BIOS-e820: [mem 0x00000000fffc0000-0x00000000ffffffff] reserved
+NX (Execute Disable) protection: active
+Hypervisor detected: KVM
+e820: last_pfn = 0x7fe0 max_arch_pfn = 0x400000000
+found SMP MP-table at [mem 0x000f1090-0x000f109f] mapped at [ffff8800000f1090]
+init_memory_mapping: [mem 0x00000000-0x000fffff]
+init_memory_mapping: [mem 0x07800000-0x079fffff]
+init_memory_mapping: [mem 0x00100000-0x077fffff]
+init_memory_mapping: [mem 0x07a00000-0x07fdffff]
+RAMDISK: [mem 0x07bc8000-0x07fd7fff]
+ACPI: Early table checksum verification disabled
+ACPI: RSDP 0x00000000000F0EA0 000014 (v00 BOCHS )
+ACPI: RSDT 0x0000000007FE1853 000034 (v01 BOCHS  BXPCRSDT 00000001 BXPC 00000001)
+ACPI: FACP 0x0000000007FE0E48 000074 (v01 BOCHS  BXPCFACP 00000001 BXPC 00000001)
+ACPI: DSDT 0x0000000007FE0040 000E08 (v01 BOCHS  BXPCDSDT 00000001 BXPC 00000001)
+ACPI: FACS 0x0000000007FE0000 000040
+ACPI: SSDT 0x0000000007FE0EBC 0008E7 (v01 BOCHS  BXPCSSDT 00000001 BXPC 00000001)
+ACPI: APIC 0x0000000007FE17A3 000078 (v01 BOCHS  BXPCAPIC 00000001 BXPC 00000001)
+ACPI: HPET 0x0000000007FE181B 000038 (v01 BOCHS  BXPCHPET 00000001 BXPC 00000001)
+kvm-clock: Using msrs 4b564d01 and 4b564d00
+kvm-clock: cpu 0, msr 0:7fdf001, primary cpu clock
+clocksource: kvm-clock: mask: 0xffffffffffffffff max_cycles: 0x1cd42e4dffb, max_idle_ns: 881590591483 ns
+Zone ranges:
+  DMA32    [mem 0x0000000000001000-0x0000000007fdffff]
+  Normal   empty
+Movable zone start for each node
+Early memory node ranges
+  node   0: [mem 0x0000000000001000-0x000000000009efff]
+  node   0: [mem 0x0000000000100000-0x0000000007fdffff]
+Initmem setup node 0 [mem 0x0000000000001000-0x0000000007fdffff]
+ACPI: PM-Timer IO Port: 0x608
+ACPI: LAPIC_NMI (acpi_id[0xff] dfl dfl lint[0x1])
+IOAPIC[0]: apic_id 0, version 17, address 0xfec00000, GSI 0-23
+ACPI: INT_SRC_OVR (bus 0 bus_irq 0 global_irq 2 dfl dfl)
+ACPI: INT_SRC_OVR (bus 0 bus_irq 5 global_irq 5 high level)
+ACPI: INT_SRC_OVR (bus 0 bus_irq 9 global_irq 9 high level)
+ACPI: INT_SRC_OVR (bus 0 bus_irq 10 global_irq 10 high level)
+ACPI: INT_SRC_OVR (bus 0 bus_irq 11 global_irq 11 high level)
+Using ACPI (MADT) for SMP configuration information
+ACPI: HPET id: 0x8086a201 base: 0xfed00000
+KVM setup async PF for cpu 0
+kvm-stealtime: cpu 0, msr 1304d00
+e820: [mem 0x08000000-0xfeffbfff] available for PCI devices
+Booting paravirtualized kernel on KVM
+clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645519600211568 ns
+Built 1 zonelists in Zone order, mobility grouping on.  Total pages: 32169
+Kernel command line: ip=dhcp rd.shell=1 console=ttyS0
+PID hash table entries: 512 (order: 0, 4096 bytes)
+Dentry cache hash table entries: 16384 (order: 5, 131072 bytes)
+Inode-cache hash table entries: 8192 (order: 4, 65536 bytes)
+Memory: 119724K/130552K available (2275K kernel code, 409K rwdata, 608K rodata, 524K init, 428K bss, 10828K reserved, 0K cma-reserved)
+NR_IRQS:4352 nr_irqs:256 16
+Console: colour VGA+ 80x25
+console [ttyS0] enabled
+clocksource: hpet: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604467 ns
+tsc: Detected 2990.378 MHz processor
+Calibrating delay loop (skipped) preset value.. 5980.75 BogoMIPS (lpj=11961512)
+pid_max: default: 4096 minimum: 301
+ACPI: Core revision 20150717
+ACPI: All ACPI Tables successfully acquired
+Mount-cache hash table entries: 512 (order: 0, 4096 bytes)
+Mountpoint-cache hash table entries: 512 (order: 0, 4096 bytes)
+Last level iTLB entries: 4KB 0, 2MB 0, 4MB 0
+Last level dTLB entries: 4KB 0, 2MB 0, 4MB 0, 1GB 0
+CPU: Intel QEMU Virtual CPU version 2.2.0 (fam: 06, model: 06, stepping: 03)
+Performance Events: Broken PMU hardware detected, using software events only.
+Failed to access perfctr msr (MSR c2 is 0)
+..TIMER: vector=0x30 apic1=0 pin1=2 apic2=-1 pin2=-1
+devtmpfs: initialized
+clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+NET: Registered protocol family 16
+cpuidle: using governor ladder
+cpuidle: using governor menu
+ACPI: bus type PCI registered
+PCI: Using configuration type 1 for base access
+ACPI: Added _OSI(Module Device)
+ACPI: Added _OSI(Processor Device)
+ACPI: Added _OSI(3.0 _SCP Extensions)
+ACPI: Added _OSI(Processor Aggregator Device)
+ACPI: Interpreter enabled
+ACPI: (supports S0 S5)
+ACPI: Using IOAPIC for interrupt routing
+PCI: Using host bridge windows from ACPI; if necessary, use "pci=nocrs" and report a bug
+ACPI: PCI Root Bridge [PCI0] (domain 0000 [bus 00-ff])
+acpi PNP0A03:00: _OSC: OS supports [Segments MSI]
+acpi PNP0A03:00: _OSC failed (AE_NOT_FOUND); disabling ASPM
+PCI host bridge to bus 0000:00
+pci_bus 0000:00: root bus resource [bus 00-ff]
+pci_bus 0000:00: root bus resource [io  0x0000-0x0cf7 window]
+pci_bus 0000:00: root bus resource [io  0x0d00-0xadff window]
+pci_bus 0000:00: root bus resource [io  0xae0f-0xaeff window]
+pci_bus 0000:00: root bus resource [io  0xaf20-0xafdf window]
+pci_bus 0000:00: root bus resource [io  0xafe4-0xffff window]
+pci_bus 0000:00: root bus resource [mem 0x000a0000-0x000bffff window]
+pci_bus 0000:00: root bus resource [mem 0x08000000-0xfebfffff window]
+pci 0000:00:01.1: legacy IDE quirk: reg 0x10: [io  0x01f0-0x01f7]
+pci 0000:00:01.1: legacy IDE quirk: reg 0x14: [io  0x03f6]
+pci 0000:00:01.1: legacy IDE quirk: reg 0x18: [io  0x0170-0x0177]
+pci 0000:00:01.1: legacy IDE quirk: reg 0x1c: [io  0x0376]
+pci 0000:00:01.3: quirk: [io  0x0600-0x063f] claimed by PIIX4 ACPI
+pci 0000:00:01.3: quirk: [io  0x0700-0x070f] claimed by PIIX4 SMB
+ACPI: PCI Interrupt Link [LNKA] (IRQs 5 *10 11)
+ACPI: PCI Interrupt Link [LNKB] (IRQs 5 *10 11)
+ACPI: PCI Interrupt Link [LNKC] (IRQs 5 10 *11)
+ACPI: PCI Interrupt Link [LNKD] (IRQs 5 10 *11)
+ACPI: PCI Interrupt Link [LNKS] (IRQs *9)
+ACPI: Enabled 16 GPEs in block 00 to 0F
+vgaarb: setting as boot device: PCI:0000:00:02.0
+vgaarb: device added: PCI:0000:00:02.0,decodes=io+mem,owns=io+mem,locks=none
+vgaarb: loaded
+vgaarb: bridge control possible 0000:00:02.0
+PCI: Using ACPI for IRQ routing
+lo uses DEPRECATED zero tx_queue_len - convert driver to use IFF_NO_QUEUE instead.
+HPET: 3 timers in total, 0 timers will be used for per-cpu timer
+clocksource: Switched to clocksource kvm-clock
+pnp: PnP ACPI init
+pnp: PnP ACPI: found 6 devices
+clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns
+NET: Registered protocol family 2
+TCP established hash table entries: 1024 (order: 1, 8192 bytes)
+TCP bind hash table entries: 1024 (order: 1, 8192 bytes)
+TCP: Hash tables configured (established 1024 bind 1024)
+UDP hash table entries: 128 (order: 0, 4096 bytes)
+UDP-Lite hash table entries: 128 (order: 0, 4096 bytes)
+NET: Registered protocol family 1
+pci 0000:00:00.0: Limiting direct PCI/PCI transfers
+pci 0000:00:01.0: PIIX3: Enabling Passive Release
+pci 0000:00:01.0: Activating ISA DMA hang workarounds
+Unpacking initramfs...
+Freeing initrd memory: 4160K (ffff880007bc8000 - ffff880007fd8000)
+9p: Installing v9fs 9p2000 file system support
+Block layer SCSI generic (bsg) driver version 0.4 loaded (major 254)
+io scheduler noop registered
+io scheduler deadline registered
+io scheduler cfq registered (default)
+input: Power Button as /devices/LNXSYSTM:00/LNXPWRBN:00/input/input0
+ACPI: Power Button [PWRF]
+Serial: 8250/16550 driver, 4 ports, IRQ sharing disabled
+00:05: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
+e1000: Intel(R) PRO/1000 Network Driver - version 7.3.21-k8-NAPI
+e1000: Copyright (c) 1999-2006 Intel Corporation.
+ACPI: PCI Interrupt Link [LNKC] enabled at IRQ 11
+e1000 0000:00:03.0 eth0: (PCI:33MHz:32-bit) 52:54:00:12:34:56
+e1000 0000:00:03.0 eth0: Intel(R) PRO/1000 Network Connection
+i8042: PNP: PS/2 Controller [PNP0303:KBD,PNP0f13:MOU] at 0x60,0x64 irq 1,12
+serio: i8042 KBD port at 0x60,0x64 irq 1
+serio: i8042 AUX port at 0x60,0x64 irq 12
+mousedev: PS/2 mouse device common for all mice
+input: AT Translated Set 2 keyboard as /devices/platform/i8042/serio0/input/input1
+NET: Registered protocol family 10
+sit: IPv6 over IPv4 tunneling driver
+sit0 uses DEPRECATED zero tx_queue_len - convert driver to use IFF_NO_QUEUE instead.
+9pnet: Installing 9P2000 support
+IPv6: ADDRCONF(NETDEV_UP): eth0: link is not ready
+input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input3
+e1000: eth0 NIC Link is Up 1000 Mbps Full Duplex, Flow Control: RX
+IPv6: ADDRCONF(NETDEV_CHANGE): eth0: link becomes ready
+Sending DHCP requests ., OK
+IP-Config: Got DHCP answer from 10.0.2.2, my address is 10.0.2.15
+IP-Config: Complete:
+     device=eth0, hwaddr=52:54:00:12:34:56, ipaddr=10.0.2.15, mask=255.255.255.0, gw=10.0.2.2
+     host=10.0.2.15, domain=, nis-domain=(none)
+     bootserver=10.0.2.2, rootserver=10.0.2.2, rootpath=
+     nameserver0=10.0.2.3
+Freeing unused kernel memory: 524K (ffffffff8133a000 - ffffffff813bd000)
+mount: /run: filesystem mounted, but mount(8) failed: Function not implemented
+dracut: dracut-15.04 (Vivid Vervet) dracut-
+dracut: FATAL: No or empty root= argument
+dracut: Refusing to continue
+
+
+dracut Warning: 
+dracut Warning: 
+dracut Warning: dracut: FATAL: No or empty root= argument
+dracut Warning: dracut: FATAL: No or empty root= argument
+dracut Warning: dracut: Refusing to continue
+dracut Warning: dracut: Refusing to continue
+
+
+Generating "/run/initramfs/sosreport.txt"
+You might want to save "/run/initramfs/sosreport.txt" to a USB stick or /boot
+after mounting them and attach it to a bug report.
+
+To get more debug information in the report,
+reboot with "rd.debug" added to the kernel command line.
+
+Dropping to debug shell.
+
+dracut:/# uname -r
+4.2.0-rc7-next-20150819+
+dracut:/# 

@@ -1,0 +1,11 @@
+arun@Tux~/D/E/Task_06> sudo insmod miscdev.ko 
+arun@Tux~/D/E/Task_06> sudo cat /dev/eudyptula 
+716e82d712cb⏎                                                                                                                                        arun@Tux~/D/E/Task_06> echo "716e82d712cb" | sudo tee /dev/eudyptula
+716e82d712cb
+arun@Tux~/D/E/Task_06> echo "605f93f544d" | sudo tee /dev/eudyptula
+605f93f544d
+tee: /dev/eudyptula: Invalid argument
+arun@Tux~/D/E/Task_06> echo "716e82d712cbb" | sudo tee /dev/eudyptula
+716e82d712cbb
+tee: /dev/eudyptula: Invalid argument
+arun@Tux~/D/E/Task_06> sudo rmmod miscdev

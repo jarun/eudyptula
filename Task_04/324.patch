@@ -1,0 +1,2417 @@
+From 7674c93e85bd3f4e0ad51f84e6b5744eae01f5af Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Wed, 11 Feb 2015 02:24:33 +0530
+Subject: [PATCH 01/18] Implementation of signal_capture in kernel driver
+ Removed extra printk. Merged to latest upstream code.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/event_table.c            |   2 +
+ driver/main.c                   | 187 ++++++++++++++++++++++++++++++++--------
+ driver/ppm.h                    |   1 +
+ driver/ppm_events.h             |   3 +
+ driver/ppm_events_public.h      |  14 ++-
+ driver/ppm_fillers.c            |  37 ++++++++
+ userspace/libscap/event_table.c |   2 +
+ 7 files changed, 209 insertions(+), 37 deletions(-)
+
+diff --git a/driver/event_table.c b/driver/event_table.c
+index 7a7d8cc..bc06029 100644
+--- a/driver/event_table.c
++++ b/driver/event_table.c
+@@ -244,4 +244,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_SYSCALL_FORK_17_X */{"fork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
+ 	/* PPME_SYSCALL_VFORK_17_E */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_VFORK_17_X */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+diff --git a/driver/main.c b/driver/main.c
+index 5001583..84a00b3 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -81,6 +81,28 @@ struct ppm_ring_buffer_context {
+ 	char *str_storage;	/* String storage. Size is one page. */
+ };
+ 
++struct event_data_t {
++	enum ppm_capture_category category;
++
++	union {
++		struct {
++			struct pt_regs *regs;
++			long id;
++		} syscall_data;
++
++		struct {
++			struct task_struct *sched_prev;
++			struct task_struct *sched_next;
++		} context_data;
++
++		struct {
++			int sig;
++			struct siginfo *info;
++			struct k_sigaction *ka;
++		} signal_data;
++	} event_info;
++};
++
+ /*
+  * FORWARD DECLARATIONS
+  */
+@@ -89,11 +111,8 @@ static int ppm_release(struct inode *inode, struct file *filp);
+ static long ppm_ioctl(struct file *f, unsigned int cmd, unsigned long arg);
+ static int ppm_mmap(struct file *filp, struct vm_area_struct *vma);
+ static int record_event(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next);
++	struct event_data_t *event_datap);
+ 
+ static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+ 
+@@ -112,6 +131,10 @@ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struc
+ #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)) */
+ #endif /* CAPTURE_CONTEXT_SWITCHES */
+ 
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka);
++#endif
++
+ DECLARE_BITMAP(g_events_mask, PPM_EVENT_MAX);
+ static struct ppm_device *g_ppm_devs;
+ static struct class *g_ppm_class;
+@@ -157,6 +180,9 @@ static struct tracepoint *tp_sched_process_exit;
+ #ifdef CAPTURE_CONTEXT_SWITCHES
+ static struct tracepoint *tp_sched_switch;
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static struct tracepoint *tp_signal_deliver;
++#endif
+ 
+ #ifdef _DEBUG
+ static bool verbose = 1;
+@@ -265,6 +291,14 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 			goto err_sched_switch;
+ 		}
+ #endif
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++		ret = compat_register_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++		if (ret) {
++			pr_err("can't create the signal_deliver tracepoint\n");
++			goto err_signal_deliver;
++		}
++#endif
+ 		g_tracepoint_registered = true;
+ 	}
+ 
+@@ -281,6 +315,10 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 	compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
+ err_sys_exit:
+ 	ring->open = false;
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++err_signal_deliver:
++	compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++#endif
+ cleanup_open:
+ 	mutex_unlock(&g_open_mutex);
+ 
+@@ -328,6 +366,9 @@ static int ppm_release(struct inode *inode, struct file *filp)
+ #ifdef CAPTURE_CONTEXT_SWITCHES
+ 			compat_unregister_trace(sched_switch_probe, "sched_switch", tp_sched_switch);
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++#endif
+ 			tracepoint_synchronize_unregister();
+ 			g_tracepoint_registered = false;
+ 		} else {
+@@ -375,6 +416,8 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	}
+ 	case PPM_IOCTL_DISABLE_DROPPING_MODE:
+ 	{
++		struct event_data_t event_data;
++
+ 		g_dropping_mode = 0;
+ 		vpr_info("PPM_IOCTL_DISABLE_DROPPING_MODE\n");
+ 		g_sampling_interval = 1000000000;
+@@ -384,7 +427,10 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		 * Push an event into the ring buffer so that the user can know that dropping
+ 		 * mode has been disabled
+ 		 */
+-		record_event(PPME_SYSDIGEVENT_E, NULL, -1, UF_NEVER_DROP, (void *)DEI_DISABLE_DROPPING, (void *)0);
++		event_data.category = PPMC_CONTEXT_SWITCH;
++		event_data.event_info.context_data.sched_prev = (void *)DEI_DISABLE_DROPPING;
++		event_data.event_info.context_data.sched_next = (void *)0;
++		record_event(PPME_SYSDIGEVENT_E, UF_NEVER_DROP, &event_data);
+ 		return 0;
+ 	}
+ 	case PPM_IOCTL_ENABLE_DROPPING_MODE:
+@@ -710,7 +756,8 @@ static enum ppm_event_type parse_socketcall(struct event_filler_arguments *fille
+ 
+ static inline void record_drop_e(void)
+ {
+-	if (record_event(PPME_DROP_E, NULL, -1, UF_NEVER_DROP, NULL, NULL) == 0) {
++	struct event_data_t event_data = {0};
++	if (record_event(PPME_DROP_E, UF_NEVER_DROP, &event_data) == 0) {
+ 		g_need_to_insert_drop_e = 1;
+ 	} else {
+ 		if (g_need_to_insert_drop_e == 1)
+@@ -722,7 +769,8 @@ static inline void record_drop_e(void)
+ 
+ static inline void record_drop_x(void)
+ {
+-	if (record_event(PPME_DROP_X, NULL, -1, UF_NEVER_DROP, NULL, NULL) == 0) {
++	struct event_data_t event_data = {0};
++	if (record_event(PPME_DROP_X, UF_NEVER_DROP, &event_data) == 0) {
+ 		g_need_to_insert_drop_x = 1;
+ 	} else {
+ 		if (g_need_to_insert_drop_x == 1)
+@@ -767,11 +815,8 @@ static inline int drop_event(enum ppm_event_type event_type, enum syscall_flags
+  * Returns 0 if the event is dropped
+  */
+ static int record_event(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next)
++	struct event_data_t *event_datap)
+ {
+ 	int res = 0;
+ 	size_t event_size;
+@@ -815,13 +860,17 @@ static int record_event(enum ppm_event_type event_type,
+ 	}
+ 
+ 	ring_info->n_evts++;
+-	if (sched_prev != NULL) {
++	if (event_datap->category == PPMC_CONTEXT_SWITCH && event_datap->event_info.context_data.sched_prev != NULL) {
+ 		if (event_type != PPME_SYSDIGEVENT_E) {
+-			ASSERT(sched_prev != NULL);
+-			ASSERT(sched_next != NULL);
+-			ASSERT(regs == NULL);
++			ASSERT(event_datap->event_info.context_data.sched_prev != NULL);
++			ASSERT(event_datap->event_info.context_data.sched_next != NULL);
++			//ASSERT(regs == NULL);
+ 			ring_info->n_context_switches++;
+ 		}
++	} else if (event_datap->category == PPMC_SIGNAL) {
++		if (event_type == PPME_SYSCALL_SIGNALDELIVER_E) {
++			ASSERT(event_datap->event_info.signal_data.info != NULL);
++		}
+ 	}
+ 
+ 	/*
+@@ -866,10 +915,10 @@ static int record_event(enum ppm_event_type event_type,
+ 	 * second argument contains a pointer to the arguments of the original
+ 	 * call. I guess this was done to reduce the number of syscalls...
+ 	 */
+-	if (regs && id == __NR_socketcall) {
++	if (event_datap->category == PPMC_SYSCALL && event_datap->event_info.syscall_data.regs && event_datap->event_info.syscall_data.id == __NR_socketcall) {
+ 		enum ppm_event_type tet;
+ 
+-		tet = parse_socketcall(&args, regs);
++		tet = parse_socketcall(&args, event_datap->event_info.syscall_data.regs);
+ 
+ 		if (event_type == PPME_GENERIC_E)
+ 			event_type = tet;
+@@ -912,10 +961,40 @@ static int record_event(enum ppm_event_type event_type,
+ #endif
+ 		args.buffer_size = min(freespace, delta_from_end) - sizeof(struct ppm_evt_hdr); /* freespace is guaranteed to be bigger than sizeof(struct ppm_evt_hdr) */
+ 		args.event_type = event_type;
+-		args.regs = regs;
+-		args.sched_prev = sched_prev;
+-		args.sched_next = sched_next;
+-		args.syscall_id = id;
++
++		if (event_datap->category == PPMC_SYSCALL) {
++			args.regs = event_datap->event_info.syscall_data.regs;
++			args.syscall_id = event_datap->event_info.syscall_data.id;
++		} else {
++			args.regs = NULL;
++			args.syscall_id = -1;
++		}
++
++		if (event_datap->category == PPMC_CONTEXT_SWITCH) {
++			args.sched_prev = event_datap->event_info.context_data.sched_prev;
++			args.sched_next = event_datap->event_info.context_data.sched_next;
++		} else {
++			args.sched_prev = NULL;
++			args.sched_next = NULL;
++		}
++
++		if (event_datap->category == PPMC_SIGNAL) {
++			args.signo = event_datap->event_info.signal_data.sig;
++			if (event_datap->event_info.signal_data.info->si_signo == __SI_KILL) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._kill._pid;
++			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_RT) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._rt._pid;
++			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_CHLD) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._sigchld._pid;
++			} else {
++				args.spid = (__kernel_pid_t) 0;
++			}
++		} else {
++			args.signo = 0;
++			args.spid = (__kernel_pid_t) 0;
++		}
++		args.dpid = current->pid;
++
+ 		args.curarg = 0;
+ 		args.arg_data_size = args.buffer_size - args.arg_data_offset;
+ 		args.nevents = ring->nevents;
+@@ -1042,6 +1121,7 @@ TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
+ 
+ 	table_index = id - SYSCALL_TABLE_ID0;
+ 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
++		struct event_data_t event_data;
+ 		int used = g_syscall_table[table_index].flags & UF_USED;
+ 		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+ 		enum ppm_event_type type;
+@@ -1057,10 +1137,14 @@ TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
+ 		type = g_syscall_table[table_index].enter_event_type;
+ #endif
+ 
+-		if (used)
+-			record_event(type, regs, id, drop_flags, NULL, NULL);
+-		else
+-			record_event(PPME_GENERIC_E, regs, id, UF_ALWAYS_DROP, NULL, NULL);
++		event_data.category = PPMC_SYSCALL;
++		event_data.event_info.syscall_data.regs = regs;
++		event_data.event_info.syscall_data.id = id;
++		if (used) {
++			record_event(type, drop_flags, &event_data);
++		} else {
++			record_event(PPME_GENERIC_E, UF_ALWAYS_DROP, &event_data);
++		}
+ 	}
+ }
+ 
+@@ -1083,6 +1167,7 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
+ 
+ 	table_index = id - SYSCALL_TABLE_ID0;
+ 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
++		struct event_data_t event_data;
+ 		int used = g_syscall_table[table_index].flags & UF_USED;
+ 		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+ 		enum ppm_event_type type;
+@@ -1098,10 +1183,14 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
+ 		type = g_syscall_table[table_index].exit_event_type;
+ #endif
+ 
+-		if (used)
+-			record_event(type, regs, id, drop_flags, NULL, NULL);
+-		else
+-			record_event(PPME_GENERIC_X, regs, id, UF_ALWAYS_DROP, NULL, NULL);
++		event_data.category = PPMC_SYSCALL;
++		event_data.event_info.syscall_data.regs = regs;
++		event_data.event_info.syscall_data.id = id;
++		if (used) {
++			record_event(type, drop_flags, &event_data);
++		} else {
++			record_event(PPME_GENERIC_X, UF_ALWAYS_DROP, &event_data);
++		}
+ 	}
+ }
+ 
+@@ -1110,6 +1199,8 @@ int __access_remote_vm(struct task_struct *t, struct mm_struct *mm, unsigned lon
+ 
+ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ {
++	struct event_data_t event_data;
++
+ 	if (unlikely(current->flags & PF_KTHREAD)) {
+ 		/*
+ 		 * We are not interested in kernel threads
+@@ -1117,7 +1208,10 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ 		return;
+ 	}
+ 
+-	record_event(PPME_PROCEXIT_1_E, NULL, -1, UF_NEVER_DROP, p, p);
++	event_data.category = PPMC_CONTEXT_SWITCH;
++	event_data.event_info.context_data.sched_prev = p;
++	event_data.event_info.context_data.sched_next = p;
++	record_event(PPME_PROCEXIT_1_E, UF_NEVER_DROP, &event_data);
+ }
+ 
+ #include <linux/ip.h>
+@@ -1131,12 +1225,23 @@ TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, st
+ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next)
+ #endif
+ {
+-	record_event(PPME_SCHEDSWITCH_6_E,
+-		NULL,
+-		-1,
+-		UF_USED,
+-		prev,
+-		next);
++	struct event_data_t event_data;
++	event_data.category = PPMC_CONTEXT_SWITCH;
++	event_data.event_info.context_data.sched_prev = prev;
++	event_data.event_info.context_data.sched_next = next;
++	record_event(PPME_SCHEDSWITCH_6_E, UF_USED, &event_data);
++}
++#endif
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka)
++{
++	struct event_data_t event_data;
++	event_data.category = PPMC_SIGNAL;
++	event_data.event_info.signal_data.sig = sig;
++	event_data.event_info.signal_data.info = info;
++	event_data.event_info.signal_data.ka = ka;
++	record_event(PPME_SYSCALL_SIGNALDELIVER_E, UF_USED, &event_data);
+ }
+ #endif
+ 
+@@ -1236,6 +1341,10 @@ static void visit_tracepoint(struct tracepoint *tp, void *priv)
+ 	else if (!strcmp(tp->name, "sched_switch"))
+ 		tp_sched_switch = tp;
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	else if (!strcmp(tp->name, "signal_deliver"))
++		tp_signal_deliver = tp;
++#endif
+ }
+ 
+ static int get_tracepoint_handles(void)
+@@ -1260,6 +1369,12 @@ static int get_tracepoint_handles(void)
+ 		return -ENOENT;
+ 	}
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	if (!tp_signal_deliver) {
++		pr_err("failed to find signal_deliver tracepoint\n");
++		return -ENOENT;
++	}
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/driver/ppm.h b/driver/ppm.h
+index 0691c95..c66bf3b 100644
+--- a/driver/ppm.h
++++ b/driver/ppm.h
+@@ -29,6 +29,7 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+  * Global defines
+  */
+ #define CAPTURE_CONTEXT_SWITCHES
++#define CAPTURE_SIGNAL_DELIVERIES
+ #define RW_SNAPLEN 80
+ #define RW_SNAPLEN_EVENT 4096
+ #define RW_MAX_SNAPLEN (256 * 1024 * 1024)
+diff --git a/driver/ppm_events.h b/driver/ppm_events.h
+index d85778e..7f41d61 100644
+--- a/driver/ppm_events.h
++++ b/driver/ppm_events.h
+@@ -47,6 +47,9 @@ struct event_filler_arguments {
+ #endif
+ 	int fd; /* Passed by some of the fillers to val_to_ring to compute the snaplen dynamically */
+ 	bool enforce_snaplen;
++	int signo; /* Signal number */
++	__kernel_pid_t spid; /* PID of source process */
++	__kernel_pid_t dpid; /* PID of destination process */
+ };
+ 
+ /*
+diff --git a/driver/ppm_events_public.h b/driver/ppm_events_public.h
+index 7bde8a0..5025012 100644
+--- a/driver/ppm_events_public.h
++++ b/driver/ppm_events_public.h
+@@ -388,6 +388,16 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+ #define PPME_IS_EXIT(x) (x & PPME_DIRECTION_FLAG)
+ #define PPME_MAKE_ENTER(x) (x & (~1))
+ 
++/*
++ * Event category to classify events in generic categories
++ */
++enum ppm_capture_category {
++	PPMC_NONE = 0,
++	PPMC_SYSCALL = 1,
++	PPMC_CONTEXT_SWITCH = 2,
++	PPMC_SIGNAL = 3,
++};
++
+ /** @defgroup etypes Event Types
+  *  @{
+  */
+@@ -614,7 +624,9 @@ enum ppm_event_type {
+ 	PPME_SYSCALL_FORK_17_X = 219,
+ 	PPME_SYSCALL_VFORK_17_E = 220,
+ 	PPME_SYSCALL_VFORK_17_X = 221,
+-	PPM_EVENT_MAX = 222
++	PPME_SYSCALL_SIGNALDELIVER_E = 222,
++	PPME_SYSCALL_SIGNALDELIVER_X = 223, /* This should never be called */
++	PPM_EVENT_MAX = 224
+ };
+ /*@}*/
+ 
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index 10fd070..eb8db3e 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -119,6 +119,9 @@ static int f_sys_quotactl_e(struct event_filler_arguments *args);
+ static int f_sys_quotactl_x(struct event_filler_arguments *args);
+ static int f_sys_sysdigevent_e(struct event_filler_arguments *args);
+ static int f_sys_getresuid_and_gid_x(struct event_filler_arguments *args);
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static int f_sys_signaldeliver_e(struct event_filler_arguments *args);
++#endif
+ 
+ /*
+  * Note, this is not part of g_event_info because we want to share g_event_info with userland.
+@@ -321,6 +324,10 @@ const struct ppm_event_entry g_ppm_events[PPM_EVENT_MAX] = {
+ 	[PPME_SYSCALL_GETRESUID_X] = {f_sys_getresuid_and_gid_x},
+ 	[PPME_SYSCALL_GETRESGID_E] = {f_sys_empty},
+ 	[PPME_SYSCALL_GETRESGID_X] = {f_sys_getresuid_and_gid_x},
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	[PPME_SYSCALL_SIGNALDELIVER_E] = {f_sys_signaldeliver_e},
++	[PPME_SYSCALL_SIGNALDELIVER_X] = {f_sys_empty},
++#endif
+ };
+ 
+ /*
+@@ -4130,3 +4137,33 @@ static int f_sys_getresuid_and_gid_x(struct event_filler_arguments *args)
+ 
+ 	return add_sentinel(args);
+ }
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static int f_sys_signaldeliver_e(struct event_filler_arguments *args)
++{
++	int res;
++
++	/*
++	 * signal number
++	 */
++	res = val_to_ring(args, args->signo, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	/*
++	 * source pid
++	 */
++	res = val_to_ring(args, args->spid, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	/*
++	 * destination pid
++	 */
++	res = val_to_ring(args, args->dpid, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	return add_sentinel(args);
++}
++#endif
+diff --git a/userspace/libscap/event_table.c b/userspace/libscap/event_table.c
+index aad655e..2728c64 100644
+--- a/userspace/libscap/event_table.c
++++ b/userspace/libscap/event_table.c
+@@ -244,4 +244,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_SYSCALL_FORK_17_X */{"fork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
+ 	/* PPME_SYSCALL_VFORK_17_E */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_VFORK_17_X */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+
+From a3b20c132c43d78575d92823743052be5b656612 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sun, 15 Feb 2015 09:31:18 +0530
+Subject: [PATCH 02/18] Added userspace parser to retrieve signal_deliver trace
+ information from kernel.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/ppm_fillers.c           | 12 ++++++------
+ userspace/libsinsp/parsers.cpp | 20 ++++++++++++++++++++
+ userspace/libsinsp/parsers.h   |  1 +
+ 3 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index eb8db3e..0465ee7 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -4144,23 +4144,23 @@ static int f_sys_signaldeliver_e(struct event_filler_arguments *args)
+ 	int res;
+ 
+ 	/*
+-	 * signal number
++	 * source pid
+ 	 */
+-	res = val_to_ring(args, args->signo, 0, false, 0);
++	res = val_to_ring(args, args->spid, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+ 	/*
+-	 * source pid
++	 * destination pid
+ 	 */
+-	res = val_to_ring(args, args->spid, 0, false, 0);
++	res = val_to_ring(args, args->dpid, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+ 	/*
+-	 * destination pid
++	 * signal number
+ 	 */
+-	res = val_to_ring(args, args->dpid, 0, false, 0);
++	res = val_to_ring(args, args->signo, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index fb71e72..2e0b70c 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -298,6 +298,9 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 	case PPME_SYSCALL_SETGID_X:
+ 		parse_setgid_exit(evt);
+ 		break;
++	case PPME_SYSCALL_SIGNALDELIVER_E:
++		parse_signal_deliver(evt);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -3181,3 +3184,20 @@ void sinsp_parser::parse_setgid_exit(sinsp_evt *evt)
+ 		evt->get_thread_info()->m_gid = new_egid;
+ 	}
+ }
++
++void sinsp_parser::parse_signal_deliver(sinsp_evt *evt)
++{
++	sinsp_evt_param *parinfo;
++
++	parinfo = evt->get_param(0);
++	ASSERT(parinfo->m_len == sizeof(uint64_t));
++	printf("spid: %lu   ", *(uint64_t *)parinfo->m_val);
++
++	parinfo = evt->get_param(1);
++	ASSERT(parinfo->m_len == sizeof(uint64_t));
++	printf("dpid: %lu   ", *(uint64_t *)parinfo->m_val);
++
++	parinfo = evt->get_param(2);
++	ASSERT(parinfo->m_len == sizeof(uint8_t));
++	printf("signal: %hhu\n", *(uint8_t *)parinfo->m_val);
++}
+diff --git a/userspace/libsinsp/parsers.h b/userspace/libsinsp/parsers.h
+index 21b521a..b6ae19b 100644
+--- a/userspace/libsinsp/parsers.h
++++ b/userspace/libsinsp/parsers.h
+@@ -102,6 +102,7 @@ class sinsp_parser
+ 	void parse_setresgid_exit(sinsp_evt* evt);
+ 	void parse_setuid_exit(sinsp_evt* evt);
+ 	void parse_setgid_exit(sinsp_evt* evt);
++	void parse_signal_deliver(sinsp_evt* evt);
+ 
+ 	inline void add_socket(sinsp_evt* evt, int64_t fd, uint32_t domain, uint32_t type, uint32_t protocol);
+ 	inline void add_pipe(sinsp_evt *evt, int64_t tid, int64_t fd, uint64_t ino);
+
+From ce01f7210754e0aae7fe19c7f55f3779c4f44351 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sun, 15 Feb 2015 10:55:23 +0530
+Subject: [PATCH 03/18] Removed userspace parser as no extra processing is
+ necessary in userspace. Removed redundant printfs from userspace.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ userspace/libsinsp/parsers.cpp | 18 ------------------
+ userspace/libsinsp/parsers.h   |  1 -
+ 2 files changed, 19 deletions(-)
+
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index 2e0b70c..639c62e 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -299,7 +299,6 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 		parse_setgid_exit(evt);
+ 		break;
+ 	case PPME_SYSCALL_SIGNALDELIVER_E:
+-		parse_signal_deliver(evt);
+ 		break;
+ 	default:
+ 		break;
+@@ -3184,20 +3183,3 @@ void sinsp_parser::parse_setgid_exit(sinsp_evt *evt)
+ 		evt->get_thread_info()->m_gid = new_egid;
+ 	}
+ }
+-
+-void sinsp_parser::parse_signal_deliver(sinsp_evt *evt)
+-{
+-	sinsp_evt_param *parinfo;
+-
+-	parinfo = evt->get_param(0);
+-	ASSERT(parinfo->m_len == sizeof(uint64_t));
+-	printf("spid: %lu   ", *(uint64_t *)parinfo->m_val);
+-
+-	parinfo = evt->get_param(1);
+-	ASSERT(parinfo->m_len == sizeof(uint64_t));
+-	printf("dpid: %lu   ", *(uint64_t *)parinfo->m_val);
+-
+-	parinfo = evt->get_param(2);
+-	ASSERT(parinfo->m_len == sizeof(uint8_t));
+-	printf("signal: %hhu\n", *(uint8_t *)parinfo->m_val);
+-}
+diff --git a/userspace/libsinsp/parsers.h b/userspace/libsinsp/parsers.h
+index b6ae19b..21b521a 100644
+--- a/userspace/libsinsp/parsers.h
++++ b/userspace/libsinsp/parsers.h
+@@ -102,7 +102,6 @@ class sinsp_parser
+ 	void parse_setresgid_exit(sinsp_evt* evt);
+ 	void parse_setuid_exit(sinsp_evt* evt);
+ 	void parse_setgid_exit(sinsp_evt* evt);
+-	void parse_signal_deliver(sinsp_evt* evt);
+ 
+ 	inline void add_socket(sinsp_evt* evt, int64_t fd, uint32_t domain, uint32_t type, uint32_t protocol);
+ 	inline void add_pipe(sinsp_evt *evt, int64_t tid, int64_t fd, uint64_t ino);
+
+From 30ad4eaa6063125e761f71218889416c9b508433 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Wed, 11 Feb 2015 02:24:33 +0530
+Subject: [PATCH 04/18] Implementation of signal_capture in kernel driver
+ Removed extra printk. Merged to latest upstream code.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/event_table.c            |   2 +
+ driver/main.c                   | 187 ++++++++++++++++++++++++++++++++--------
+ driver/ppm.h                    |   1 +
+ driver/ppm_events.h             |   3 +
+ driver/ppm_events_public.h      |  14 ++-
+ driver/ppm_fillers.c            |  37 ++++++++
+ userspace/libscap/event_table.c |   2 +
+ 7 files changed, 209 insertions(+), 37 deletions(-)
+
+diff --git a/driver/event_table.c b/driver/event_table.c
+index 7a7d8cc..bc06029 100644
+--- a/driver/event_table.c
++++ b/driver/event_table.c
+@@ -244,4 +244,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_SYSCALL_FORK_17_X */{"fork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
+ 	/* PPME_SYSCALL_VFORK_17_E */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_VFORK_17_X */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+diff --git a/driver/main.c b/driver/main.c
+index 5001583..84a00b3 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -81,6 +81,28 @@ struct ppm_ring_buffer_context {
+ 	char *str_storage;	/* String storage. Size is one page. */
+ };
+ 
++struct event_data_t {
++	enum ppm_capture_category category;
++
++	union {
++		struct {
++			struct pt_regs *regs;
++			long id;
++		} syscall_data;
++
++		struct {
++			struct task_struct *sched_prev;
++			struct task_struct *sched_next;
++		} context_data;
++
++		struct {
++			int sig;
++			struct siginfo *info;
++			struct k_sigaction *ka;
++		} signal_data;
++	} event_info;
++};
++
+ /*
+  * FORWARD DECLARATIONS
+  */
+@@ -89,11 +111,8 @@ static int ppm_release(struct inode *inode, struct file *filp);
+ static long ppm_ioctl(struct file *f, unsigned int cmd, unsigned long arg);
+ static int ppm_mmap(struct file *filp, struct vm_area_struct *vma);
+ static int record_event(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next);
++	struct event_data_t *event_datap);
+ 
+ static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+ 
+@@ -112,6 +131,10 @@ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struc
+ #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)) */
+ #endif /* CAPTURE_CONTEXT_SWITCHES */
+ 
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka);
++#endif
++
+ DECLARE_BITMAP(g_events_mask, PPM_EVENT_MAX);
+ static struct ppm_device *g_ppm_devs;
+ static struct class *g_ppm_class;
+@@ -157,6 +180,9 @@ static struct tracepoint *tp_sched_process_exit;
+ #ifdef CAPTURE_CONTEXT_SWITCHES
+ static struct tracepoint *tp_sched_switch;
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static struct tracepoint *tp_signal_deliver;
++#endif
+ 
+ #ifdef _DEBUG
+ static bool verbose = 1;
+@@ -265,6 +291,14 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 			goto err_sched_switch;
+ 		}
+ #endif
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++		ret = compat_register_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++		if (ret) {
++			pr_err("can't create the signal_deliver tracepoint\n");
++			goto err_signal_deliver;
++		}
++#endif
+ 		g_tracepoint_registered = true;
+ 	}
+ 
+@@ -281,6 +315,10 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 	compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
+ err_sys_exit:
+ 	ring->open = false;
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++err_signal_deliver:
++	compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++#endif
+ cleanup_open:
+ 	mutex_unlock(&g_open_mutex);
+ 
+@@ -328,6 +366,9 @@ static int ppm_release(struct inode *inode, struct file *filp)
+ #ifdef CAPTURE_CONTEXT_SWITCHES
+ 			compat_unregister_trace(sched_switch_probe, "sched_switch", tp_sched_switch);
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++#endif
+ 			tracepoint_synchronize_unregister();
+ 			g_tracepoint_registered = false;
+ 		} else {
+@@ -375,6 +416,8 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	}
+ 	case PPM_IOCTL_DISABLE_DROPPING_MODE:
+ 	{
++		struct event_data_t event_data;
++
+ 		g_dropping_mode = 0;
+ 		vpr_info("PPM_IOCTL_DISABLE_DROPPING_MODE\n");
+ 		g_sampling_interval = 1000000000;
+@@ -384,7 +427,10 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		 * Push an event into the ring buffer so that the user can know that dropping
+ 		 * mode has been disabled
+ 		 */
+-		record_event(PPME_SYSDIGEVENT_E, NULL, -1, UF_NEVER_DROP, (void *)DEI_DISABLE_DROPPING, (void *)0);
++		event_data.category = PPMC_CONTEXT_SWITCH;
++		event_data.event_info.context_data.sched_prev = (void *)DEI_DISABLE_DROPPING;
++		event_data.event_info.context_data.sched_next = (void *)0;
++		record_event(PPME_SYSDIGEVENT_E, UF_NEVER_DROP, &event_data);
+ 		return 0;
+ 	}
+ 	case PPM_IOCTL_ENABLE_DROPPING_MODE:
+@@ -710,7 +756,8 @@ static enum ppm_event_type parse_socketcall(struct event_filler_arguments *fille
+ 
+ static inline void record_drop_e(void)
+ {
+-	if (record_event(PPME_DROP_E, NULL, -1, UF_NEVER_DROP, NULL, NULL) == 0) {
++	struct event_data_t event_data = {0};
++	if (record_event(PPME_DROP_E, UF_NEVER_DROP, &event_data) == 0) {
+ 		g_need_to_insert_drop_e = 1;
+ 	} else {
+ 		if (g_need_to_insert_drop_e == 1)
+@@ -722,7 +769,8 @@ static inline void record_drop_e(void)
+ 
+ static inline void record_drop_x(void)
+ {
+-	if (record_event(PPME_DROP_X, NULL, -1, UF_NEVER_DROP, NULL, NULL) == 0) {
++	struct event_data_t event_data = {0};
++	if (record_event(PPME_DROP_X, UF_NEVER_DROP, &event_data) == 0) {
+ 		g_need_to_insert_drop_x = 1;
+ 	} else {
+ 		if (g_need_to_insert_drop_x == 1)
+@@ -767,11 +815,8 @@ static inline int drop_event(enum ppm_event_type event_type, enum syscall_flags
+  * Returns 0 if the event is dropped
+  */
+ static int record_event(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next)
++	struct event_data_t *event_datap)
+ {
+ 	int res = 0;
+ 	size_t event_size;
+@@ -815,13 +860,17 @@ static int record_event(enum ppm_event_type event_type,
+ 	}
+ 
+ 	ring_info->n_evts++;
+-	if (sched_prev != NULL) {
++	if (event_datap->category == PPMC_CONTEXT_SWITCH && event_datap->event_info.context_data.sched_prev != NULL) {
+ 		if (event_type != PPME_SYSDIGEVENT_E) {
+-			ASSERT(sched_prev != NULL);
+-			ASSERT(sched_next != NULL);
+-			ASSERT(regs == NULL);
++			ASSERT(event_datap->event_info.context_data.sched_prev != NULL);
++			ASSERT(event_datap->event_info.context_data.sched_next != NULL);
++			//ASSERT(regs == NULL);
+ 			ring_info->n_context_switches++;
+ 		}
++	} else if (event_datap->category == PPMC_SIGNAL) {
++		if (event_type == PPME_SYSCALL_SIGNALDELIVER_E) {
++			ASSERT(event_datap->event_info.signal_data.info != NULL);
++		}
+ 	}
+ 
+ 	/*
+@@ -866,10 +915,10 @@ static int record_event(enum ppm_event_type event_type,
+ 	 * second argument contains a pointer to the arguments of the original
+ 	 * call. I guess this was done to reduce the number of syscalls...
+ 	 */
+-	if (regs && id == __NR_socketcall) {
++	if (event_datap->category == PPMC_SYSCALL && event_datap->event_info.syscall_data.regs && event_datap->event_info.syscall_data.id == __NR_socketcall) {
+ 		enum ppm_event_type tet;
+ 
+-		tet = parse_socketcall(&args, regs);
++		tet = parse_socketcall(&args, event_datap->event_info.syscall_data.regs);
+ 
+ 		if (event_type == PPME_GENERIC_E)
+ 			event_type = tet;
+@@ -912,10 +961,40 @@ static int record_event(enum ppm_event_type event_type,
+ #endif
+ 		args.buffer_size = min(freespace, delta_from_end) - sizeof(struct ppm_evt_hdr); /* freespace is guaranteed to be bigger than sizeof(struct ppm_evt_hdr) */
+ 		args.event_type = event_type;
+-		args.regs = regs;
+-		args.sched_prev = sched_prev;
+-		args.sched_next = sched_next;
+-		args.syscall_id = id;
++
++		if (event_datap->category == PPMC_SYSCALL) {
++			args.regs = event_datap->event_info.syscall_data.regs;
++			args.syscall_id = event_datap->event_info.syscall_data.id;
++		} else {
++			args.regs = NULL;
++			args.syscall_id = -1;
++		}
++
++		if (event_datap->category == PPMC_CONTEXT_SWITCH) {
++			args.sched_prev = event_datap->event_info.context_data.sched_prev;
++			args.sched_next = event_datap->event_info.context_data.sched_next;
++		} else {
++			args.sched_prev = NULL;
++			args.sched_next = NULL;
++		}
++
++		if (event_datap->category == PPMC_SIGNAL) {
++			args.signo = event_datap->event_info.signal_data.sig;
++			if (event_datap->event_info.signal_data.info->si_signo == __SI_KILL) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._kill._pid;
++			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_RT) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._rt._pid;
++			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_CHLD) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._sigchld._pid;
++			} else {
++				args.spid = (__kernel_pid_t) 0;
++			}
++		} else {
++			args.signo = 0;
++			args.spid = (__kernel_pid_t) 0;
++		}
++		args.dpid = current->pid;
++
+ 		args.curarg = 0;
+ 		args.arg_data_size = args.buffer_size - args.arg_data_offset;
+ 		args.nevents = ring->nevents;
+@@ -1042,6 +1121,7 @@ TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
+ 
+ 	table_index = id - SYSCALL_TABLE_ID0;
+ 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
++		struct event_data_t event_data;
+ 		int used = g_syscall_table[table_index].flags & UF_USED;
+ 		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+ 		enum ppm_event_type type;
+@@ -1057,10 +1137,14 @@ TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
+ 		type = g_syscall_table[table_index].enter_event_type;
+ #endif
+ 
+-		if (used)
+-			record_event(type, regs, id, drop_flags, NULL, NULL);
+-		else
+-			record_event(PPME_GENERIC_E, regs, id, UF_ALWAYS_DROP, NULL, NULL);
++		event_data.category = PPMC_SYSCALL;
++		event_data.event_info.syscall_data.regs = regs;
++		event_data.event_info.syscall_data.id = id;
++		if (used) {
++			record_event(type, drop_flags, &event_data);
++		} else {
++			record_event(PPME_GENERIC_E, UF_ALWAYS_DROP, &event_data);
++		}
+ 	}
+ }
+ 
+@@ -1083,6 +1167,7 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
+ 
+ 	table_index = id - SYSCALL_TABLE_ID0;
+ 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
++		struct event_data_t event_data;
+ 		int used = g_syscall_table[table_index].flags & UF_USED;
+ 		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+ 		enum ppm_event_type type;
+@@ -1098,10 +1183,14 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
+ 		type = g_syscall_table[table_index].exit_event_type;
+ #endif
+ 
+-		if (used)
+-			record_event(type, regs, id, drop_flags, NULL, NULL);
+-		else
+-			record_event(PPME_GENERIC_X, regs, id, UF_ALWAYS_DROP, NULL, NULL);
++		event_data.category = PPMC_SYSCALL;
++		event_data.event_info.syscall_data.regs = regs;
++		event_data.event_info.syscall_data.id = id;
++		if (used) {
++			record_event(type, drop_flags, &event_data);
++		} else {
++			record_event(PPME_GENERIC_X, UF_ALWAYS_DROP, &event_data);
++		}
+ 	}
+ }
+ 
+@@ -1110,6 +1199,8 @@ int __access_remote_vm(struct task_struct *t, struct mm_struct *mm, unsigned lon
+ 
+ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ {
++	struct event_data_t event_data;
++
+ 	if (unlikely(current->flags & PF_KTHREAD)) {
+ 		/*
+ 		 * We are not interested in kernel threads
+@@ -1117,7 +1208,10 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ 		return;
+ 	}
+ 
+-	record_event(PPME_PROCEXIT_1_E, NULL, -1, UF_NEVER_DROP, p, p);
++	event_data.category = PPMC_CONTEXT_SWITCH;
++	event_data.event_info.context_data.sched_prev = p;
++	event_data.event_info.context_data.sched_next = p;
++	record_event(PPME_PROCEXIT_1_E, UF_NEVER_DROP, &event_data);
+ }
+ 
+ #include <linux/ip.h>
+@@ -1131,12 +1225,23 @@ TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, st
+ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next)
+ #endif
+ {
+-	record_event(PPME_SCHEDSWITCH_6_E,
+-		NULL,
+-		-1,
+-		UF_USED,
+-		prev,
+-		next);
++	struct event_data_t event_data;
++	event_data.category = PPMC_CONTEXT_SWITCH;
++	event_data.event_info.context_data.sched_prev = prev;
++	event_data.event_info.context_data.sched_next = next;
++	record_event(PPME_SCHEDSWITCH_6_E, UF_USED, &event_data);
++}
++#endif
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka)
++{
++	struct event_data_t event_data;
++	event_data.category = PPMC_SIGNAL;
++	event_data.event_info.signal_data.sig = sig;
++	event_data.event_info.signal_data.info = info;
++	event_data.event_info.signal_data.ka = ka;
++	record_event(PPME_SYSCALL_SIGNALDELIVER_E, UF_USED, &event_data);
+ }
+ #endif
+ 
+@@ -1236,6 +1341,10 @@ static void visit_tracepoint(struct tracepoint *tp, void *priv)
+ 	else if (!strcmp(tp->name, "sched_switch"))
+ 		tp_sched_switch = tp;
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	else if (!strcmp(tp->name, "signal_deliver"))
++		tp_signal_deliver = tp;
++#endif
+ }
+ 
+ static int get_tracepoint_handles(void)
+@@ -1260,6 +1369,12 @@ static int get_tracepoint_handles(void)
+ 		return -ENOENT;
+ 	}
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	if (!tp_signal_deliver) {
++		pr_err("failed to find signal_deliver tracepoint\n");
++		return -ENOENT;
++	}
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/driver/ppm.h b/driver/ppm.h
+index 0691c95..c66bf3b 100644
+--- a/driver/ppm.h
++++ b/driver/ppm.h
+@@ -29,6 +29,7 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+  * Global defines
+  */
+ #define CAPTURE_CONTEXT_SWITCHES
++#define CAPTURE_SIGNAL_DELIVERIES
+ #define RW_SNAPLEN 80
+ #define RW_SNAPLEN_EVENT 4096
+ #define RW_MAX_SNAPLEN (256 * 1024 * 1024)
+diff --git a/driver/ppm_events.h b/driver/ppm_events.h
+index d85778e..7f41d61 100644
+--- a/driver/ppm_events.h
++++ b/driver/ppm_events.h
+@@ -47,6 +47,9 @@ struct event_filler_arguments {
+ #endif
+ 	int fd; /* Passed by some of the fillers to val_to_ring to compute the snaplen dynamically */
+ 	bool enforce_snaplen;
++	int signo; /* Signal number */
++	__kernel_pid_t spid; /* PID of source process */
++	__kernel_pid_t dpid; /* PID of destination process */
+ };
+ 
+ /*
+diff --git a/driver/ppm_events_public.h b/driver/ppm_events_public.h
+index 7bde8a0..5025012 100644
+--- a/driver/ppm_events_public.h
++++ b/driver/ppm_events_public.h
+@@ -388,6 +388,16 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+ #define PPME_IS_EXIT(x) (x & PPME_DIRECTION_FLAG)
+ #define PPME_MAKE_ENTER(x) (x & (~1))
+ 
++/*
++ * Event category to classify events in generic categories
++ */
++enum ppm_capture_category {
++	PPMC_NONE = 0,
++	PPMC_SYSCALL = 1,
++	PPMC_CONTEXT_SWITCH = 2,
++	PPMC_SIGNAL = 3,
++};
++
+ /** @defgroup etypes Event Types
+  *  @{
+  */
+@@ -614,7 +624,9 @@ enum ppm_event_type {
+ 	PPME_SYSCALL_FORK_17_X = 219,
+ 	PPME_SYSCALL_VFORK_17_E = 220,
+ 	PPME_SYSCALL_VFORK_17_X = 221,
+-	PPM_EVENT_MAX = 222
++	PPME_SYSCALL_SIGNALDELIVER_E = 222,
++	PPME_SYSCALL_SIGNALDELIVER_X = 223, /* This should never be called */
++	PPM_EVENT_MAX = 224
+ };
+ /*@}*/
+ 
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index 10fd070..eb8db3e 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -119,6 +119,9 @@ static int f_sys_quotactl_e(struct event_filler_arguments *args);
+ static int f_sys_quotactl_x(struct event_filler_arguments *args);
+ static int f_sys_sysdigevent_e(struct event_filler_arguments *args);
+ static int f_sys_getresuid_and_gid_x(struct event_filler_arguments *args);
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static int f_sys_signaldeliver_e(struct event_filler_arguments *args);
++#endif
+ 
+ /*
+  * Note, this is not part of g_event_info because we want to share g_event_info with userland.
+@@ -321,6 +324,10 @@ const struct ppm_event_entry g_ppm_events[PPM_EVENT_MAX] = {
+ 	[PPME_SYSCALL_GETRESUID_X] = {f_sys_getresuid_and_gid_x},
+ 	[PPME_SYSCALL_GETRESGID_E] = {f_sys_empty},
+ 	[PPME_SYSCALL_GETRESGID_X] = {f_sys_getresuid_and_gid_x},
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	[PPME_SYSCALL_SIGNALDELIVER_E] = {f_sys_signaldeliver_e},
++	[PPME_SYSCALL_SIGNALDELIVER_X] = {f_sys_empty},
++#endif
+ };
+ 
+ /*
+@@ -4130,3 +4137,33 @@ static int f_sys_getresuid_and_gid_x(struct event_filler_arguments *args)
+ 
+ 	return add_sentinel(args);
+ }
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static int f_sys_signaldeliver_e(struct event_filler_arguments *args)
++{
++	int res;
++
++	/*
++	 * signal number
++	 */
++	res = val_to_ring(args, args->signo, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	/*
++	 * source pid
++	 */
++	res = val_to_ring(args, args->spid, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	/*
++	 * destination pid
++	 */
++	res = val_to_ring(args, args->dpid, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	return add_sentinel(args);
++}
++#endif
+diff --git a/userspace/libscap/event_table.c b/userspace/libscap/event_table.c
+index aad655e..2728c64 100644
+--- a/userspace/libscap/event_table.c
++++ b/userspace/libscap/event_table.c
+@@ -244,4 +244,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_SYSCALL_FORK_17_X */{"fork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
+ 	/* PPME_SYSCALL_VFORK_17_E */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_VFORK_17_X */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+
+From e935e8db110b0b9aac7fa4a7549e0f4d786dc7b4 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sun, 15 Feb 2015 09:31:18 +0530
+Subject: [PATCH 05/18] Added userspace parser to retrieve signal_deliver trace
+ information from kernel.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/ppm_fillers.c           | 12 ++++++------
+ userspace/libsinsp/parsers.cpp | 20 ++++++++++++++++++++
+ userspace/libsinsp/parsers.h   |  1 +
+ 3 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index eb8db3e..0465ee7 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -4144,23 +4144,23 @@ static int f_sys_signaldeliver_e(struct event_filler_arguments *args)
+ 	int res;
+ 
+ 	/*
+-	 * signal number
++	 * source pid
+ 	 */
+-	res = val_to_ring(args, args->signo, 0, false, 0);
++	res = val_to_ring(args, args->spid, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+ 	/*
+-	 * source pid
++	 * destination pid
+ 	 */
+-	res = val_to_ring(args, args->spid, 0, false, 0);
++	res = val_to_ring(args, args->dpid, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+ 	/*
+-	 * destination pid
++	 * signal number
+ 	 */
+-	res = val_to_ring(args, args->dpid, 0, false, 0);
++	res = val_to_ring(args, args->signo, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index fb71e72..2e0b70c 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -298,6 +298,9 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 	case PPME_SYSCALL_SETGID_X:
+ 		parse_setgid_exit(evt);
+ 		break;
++	case PPME_SYSCALL_SIGNALDELIVER_E:
++		parse_signal_deliver(evt);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -3181,3 +3184,20 @@ void sinsp_parser::parse_setgid_exit(sinsp_evt *evt)
+ 		evt->get_thread_info()->m_gid = new_egid;
+ 	}
+ }
++
++void sinsp_parser::parse_signal_deliver(sinsp_evt *evt)
++{
++	sinsp_evt_param *parinfo;
++
++	parinfo = evt->get_param(0);
++	ASSERT(parinfo->m_len == sizeof(uint64_t));
++	printf("spid: %lu   ", *(uint64_t *)parinfo->m_val);
++
++	parinfo = evt->get_param(1);
++	ASSERT(parinfo->m_len == sizeof(uint64_t));
++	printf("dpid: %lu   ", *(uint64_t *)parinfo->m_val);
++
++	parinfo = evt->get_param(2);
++	ASSERT(parinfo->m_len == sizeof(uint8_t));
++	printf("signal: %hhu\n", *(uint8_t *)parinfo->m_val);
++}
+diff --git a/userspace/libsinsp/parsers.h b/userspace/libsinsp/parsers.h
+index 21b521a..b6ae19b 100644
+--- a/userspace/libsinsp/parsers.h
++++ b/userspace/libsinsp/parsers.h
+@@ -102,6 +102,7 @@ class sinsp_parser
+ 	void parse_setresgid_exit(sinsp_evt* evt);
+ 	void parse_setuid_exit(sinsp_evt* evt);
+ 	void parse_setgid_exit(sinsp_evt* evt);
++	void parse_signal_deliver(sinsp_evt* evt);
+ 
+ 	inline void add_socket(sinsp_evt* evt, int64_t fd, uint32_t domain, uint32_t type, uint32_t protocol);
+ 	inline void add_pipe(sinsp_evt *evt, int64_t tid, int64_t fd, uint64_t ino);
+
+From 9158b1f2824c1b1cf776930dac94eaf6f92e9f95 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sun, 15 Feb 2015 10:55:23 +0530
+Subject: [PATCH 06/18] Removed userspace parser as no extra processing is
+ necessary in userspace. Removed redundant printfs from userspace.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ userspace/libsinsp/parsers.cpp | 18 ------------------
+ userspace/libsinsp/parsers.h   |  1 -
+ 2 files changed, 19 deletions(-)
+
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index 2e0b70c..639c62e 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -299,7 +299,6 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 		parse_setgid_exit(evt);
+ 		break;
+ 	case PPME_SYSCALL_SIGNALDELIVER_E:
+-		parse_signal_deliver(evt);
+ 		break;
+ 	default:
+ 		break;
+@@ -3184,20 +3183,3 @@ void sinsp_parser::parse_setgid_exit(sinsp_evt *evt)
+ 		evt->get_thread_info()->m_gid = new_egid;
+ 	}
+ }
+-
+-void sinsp_parser::parse_signal_deliver(sinsp_evt *evt)
+-{
+-	sinsp_evt_param *parinfo;
+-
+-	parinfo = evt->get_param(0);
+-	ASSERT(parinfo->m_len == sizeof(uint64_t));
+-	printf("spid: %lu   ", *(uint64_t *)parinfo->m_val);
+-
+-	parinfo = evt->get_param(1);
+-	ASSERT(parinfo->m_len == sizeof(uint64_t));
+-	printf("dpid: %lu   ", *(uint64_t *)parinfo->m_val);
+-
+-	parinfo = evt->get_param(2);
+-	ASSERT(parinfo->m_len == sizeof(uint8_t));
+-	printf("signal: %hhu\n", *(uint8_t *)parinfo->m_val);
+-}
+diff --git a/userspace/libsinsp/parsers.h b/userspace/libsinsp/parsers.h
+index b6ae19b..21b521a 100644
+--- a/userspace/libsinsp/parsers.h
++++ b/userspace/libsinsp/parsers.h
+@@ -102,7 +102,6 @@ class sinsp_parser
+ 	void parse_setresgid_exit(sinsp_evt* evt);
+ 	void parse_setuid_exit(sinsp_evt* evt);
+ 	void parse_setgid_exit(sinsp_evt* evt);
+-	void parse_signal_deliver(sinsp_evt* evt);
+ 
+ 	inline void add_socket(sinsp_evt* evt, int64_t fd, uint32_t domain, uint32_t type, uint32_t protocol);
+ 	inline void add_pipe(sinsp_evt *evt, int64_t tid, int64_t fd, uint64_t ino);
+
+From fea90e7c3a01d80118112a0c9d432b986fca7c1f Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Wed, 11 Feb 2015 02:24:33 +0530
+Subject: [PATCH 07/18] Implementation of signal_capture in kernel driver
+ Removed extra printk. Merged to latest upstream code.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/event_table.c            |   2 +
+ driver/main.c                   | 187 ++++++++++++++++++++++++++++++++--------
+ driver/ppm.h                    |   1 +
+ driver/ppm_events.h             |   3 +
+ driver/ppm_events_public.h      |  14 ++-
+ driver/ppm_fillers.c            |  37 ++++++++
+ userspace/libscap/event_table.c |   2 +
+ 7 files changed, 209 insertions(+), 37 deletions(-)
+
+diff --git a/driver/event_table.c b/driver/event_table.c
+index 7a7d8cc..bc06029 100644
+--- a/driver/event_table.c
++++ b/driver/event_table.c
+@@ -244,4 +244,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_SYSCALL_FORK_17_X */{"fork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
+ 	/* PPME_SYSCALL_VFORK_17_E */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_VFORK_17_X */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+diff --git a/driver/main.c b/driver/main.c
+index 5001583..84a00b3 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -81,6 +81,28 @@ struct ppm_ring_buffer_context {
+ 	char *str_storage;	/* String storage. Size is one page. */
+ };
+ 
++struct event_data_t {
++	enum ppm_capture_category category;
++
++	union {
++		struct {
++			struct pt_regs *regs;
++			long id;
++		} syscall_data;
++
++		struct {
++			struct task_struct *sched_prev;
++			struct task_struct *sched_next;
++		} context_data;
++
++		struct {
++			int sig;
++			struct siginfo *info;
++			struct k_sigaction *ka;
++		} signal_data;
++	} event_info;
++};
++
+ /*
+  * FORWARD DECLARATIONS
+  */
+@@ -89,11 +111,8 @@ static int ppm_release(struct inode *inode, struct file *filp);
+ static long ppm_ioctl(struct file *f, unsigned int cmd, unsigned long arg);
+ static int ppm_mmap(struct file *filp, struct vm_area_struct *vma);
+ static int record_event(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next);
++	struct event_data_t *event_datap);
+ 
+ static ssize_t ppe_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+ 
+@@ -112,6 +131,10 @@ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struc
+ #endif /* (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35)) */
+ #endif /* CAPTURE_CONTEXT_SWITCHES */
+ 
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka);
++#endif
++
+ DECLARE_BITMAP(g_events_mask, PPM_EVENT_MAX);
+ static struct ppm_device *g_ppm_devs;
+ static struct class *g_ppm_class;
+@@ -157,6 +180,9 @@ static struct tracepoint *tp_sched_process_exit;
+ #ifdef CAPTURE_CONTEXT_SWITCHES
+ static struct tracepoint *tp_sched_switch;
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static struct tracepoint *tp_signal_deliver;
++#endif
+ 
+ #ifdef _DEBUG
+ static bool verbose = 1;
+@@ -265,6 +291,14 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 			goto err_sched_switch;
+ 		}
+ #endif
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++		ret = compat_register_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++		if (ret) {
++			pr_err("can't create the signal_deliver tracepoint\n");
++			goto err_signal_deliver;
++		}
++#endif
+ 		g_tracepoint_registered = true;
+ 	}
+ 
+@@ -281,6 +315,10 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 	compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
+ err_sys_exit:
+ 	ring->open = false;
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++err_signal_deliver:
++	compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++#endif
+ cleanup_open:
+ 	mutex_unlock(&g_open_mutex);
+ 
+@@ -328,6 +366,9 @@ static int ppm_release(struct inode *inode, struct file *filp)
+ #ifdef CAPTURE_CONTEXT_SWITCHES
+ 			compat_unregister_trace(sched_switch_probe, "sched_switch", tp_sched_switch);
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++#endif
+ 			tracepoint_synchronize_unregister();
+ 			g_tracepoint_registered = false;
+ 		} else {
+@@ -375,6 +416,8 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	}
+ 	case PPM_IOCTL_DISABLE_DROPPING_MODE:
+ 	{
++		struct event_data_t event_data;
++
+ 		g_dropping_mode = 0;
+ 		vpr_info("PPM_IOCTL_DISABLE_DROPPING_MODE\n");
+ 		g_sampling_interval = 1000000000;
+@@ -384,7 +427,10 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		 * Push an event into the ring buffer so that the user can know that dropping
+ 		 * mode has been disabled
+ 		 */
+-		record_event(PPME_SYSDIGEVENT_E, NULL, -1, UF_NEVER_DROP, (void *)DEI_DISABLE_DROPPING, (void *)0);
++		event_data.category = PPMC_CONTEXT_SWITCH;
++		event_data.event_info.context_data.sched_prev = (void *)DEI_DISABLE_DROPPING;
++		event_data.event_info.context_data.sched_next = (void *)0;
++		record_event(PPME_SYSDIGEVENT_E, UF_NEVER_DROP, &event_data);
+ 		return 0;
+ 	}
+ 	case PPM_IOCTL_ENABLE_DROPPING_MODE:
+@@ -710,7 +756,8 @@ static enum ppm_event_type parse_socketcall(struct event_filler_arguments *fille
+ 
+ static inline void record_drop_e(void)
+ {
+-	if (record_event(PPME_DROP_E, NULL, -1, UF_NEVER_DROP, NULL, NULL) == 0) {
++	struct event_data_t event_data = {0};
++	if (record_event(PPME_DROP_E, UF_NEVER_DROP, &event_data) == 0) {
+ 		g_need_to_insert_drop_e = 1;
+ 	} else {
+ 		if (g_need_to_insert_drop_e == 1)
+@@ -722,7 +769,8 @@ static inline void record_drop_e(void)
+ 
+ static inline void record_drop_x(void)
+ {
+-	if (record_event(PPME_DROP_X, NULL, -1, UF_NEVER_DROP, NULL, NULL) == 0) {
++	struct event_data_t event_data = {0};
++	if (record_event(PPME_DROP_X, UF_NEVER_DROP, &event_data) == 0) {
+ 		g_need_to_insert_drop_x = 1;
+ 	} else {
+ 		if (g_need_to_insert_drop_x == 1)
+@@ -767,11 +815,8 @@ static inline int drop_event(enum ppm_event_type event_type, enum syscall_flags
+  * Returns 0 if the event is dropped
+  */
+ static int record_event(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next)
++	struct event_data_t *event_datap)
+ {
+ 	int res = 0;
+ 	size_t event_size;
+@@ -815,13 +860,17 @@ static int record_event(enum ppm_event_type event_type,
+ 	}
+ 
+ 	ring_info->n_evts++;
+-	if (sched_prev != NULL) {
++	if (event_datap->category == PPMC_CONTEXT_SWITCH && event_datap->event_info.context_data.sched_prev != NULL) {
+ 		if (event_type != PPME_SYSDIGEVENT_E) {
+-			ASSERT(sched_prev != NULL);
+-			ASSERT(sched_next != NULL);
+-			ASSERT(regs == NULL);
++			ASSERT(event_datap->event_info.context_data.sched_prev != NULL);
++			ASSERT(event_datap->event_info.context_data.sched_next != NULL);
++			//ASSERT(regs == NULL);
+ 			ring_info->n_context_switches++;
+ 		}
++	} else if (event_datap->category == PPMC_SIGNAL) {
++		if (event_type == PPME_SYSCALL_SIGNALDELIVER_E) {
++			ASSERT(event_datap->event_info.signal_data.info != NULL);
++		}
+ 	}
+ 
+ 	/*
+@@ -866,10 +915,10 @@ static int record_event(enum ppm_event_type event_type,
+ 	 * second argument contains a pointer to the arguments of the original
+ 	 * call. I guess this was done to reduce the number of syscalls...
+ 	 */
+-	if (regs && id == __NR_socketcall) {
++	if (event_datap->category == PPMC_SYSCALL && event_datap->event_info.syscall_data.regs && event_datap->event_info.syscall_data.id == __NR_socketcall) {
+ 		enum ppm_event_type tet;
+ 
+-		tet = parse_socketcall(&args, regs);
++		tet = parse_socketcall(&args, event_datap->event_info.syscall_data.regs);
+ 
+ 		if (event_type == PPME_GENERIC_E)
+ 			event_type = tet;
+@@ -912,10 +961,40 @@ static int record_event(enum ppm_event_type event_type,
+ #endif
+ 		args.buffer_size = min(freespace, delta_from_end) - sizeof(struct ppm_evt_hdr); /* freespace is guaranteed to be bigger than sizeof(struct ppm_evt_hdr) */
+ 		args.event_type = event_type;
+-		args.regs = regs;
+-		args.sched_prev = sched_prev;
+-		args.sched_next = sched_next;
+-		args.syscall_id = id;
++
++		if (event_datap->category == PPMC_SYSCALL) {
++			args.regs = event_datap->event_info.syscall_data.regs;
++			args.syscall_id = event_datap->event_info.syscall_data.id;
++		} else {
++			args.regs = NULL;
++			args.syscall_id = -1;
++		}
++
++		if (event_datap->category == PPMC_CONTEXT_SWITCH) {
++			args.sched_prev = event_datap->event_info.context_data.sched_prev;
++			args.sched_next = event_datap->event_info.context_data.sched_next;
++		} else {
++			args.sched_prev = NULL;
++			args.sched_next = NULL;
++		}
++
++		if (event_datap->category == PPMC_SIGNAL) {
++			args.signo = event_datap->event_info.signal_data.sig;
++			if (event_datap->event_info.signal_data.info->si_signo == __SI_KILL) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._kill._pid;
++			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_RT) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._rt._pid;
++			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_CHLD) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._sigchld._pid;
++			} else {
++				args.spid = (__kernel_pid_t) 0;
++			}
++		} else {
++			args.signo = 0;
++			args.spid = (__kernel_pid_t) 0;
++		}
++		args.dpid = current->pid;
++
+ 		args.curarg = 0;
+ 		args.arg_data_size = args.buffer_size - args.arg_data_offset;
+ 		args.nevents = ring->nevents;
+@@ -1042,6 +1121,7 @@ TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
+ 
+ 	table_index = id - SYSCALL_TABLE_ID0;
+ 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
++		struct event_data_t event_data;
+ 		int used = g_syscall_table[table_index].flags & UF_USED;
+ 		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+ 		enum ppm_event_type type;
+@@ -1057,10 +1137,14 @@ TRACEPOINT_PROBE(syscall_enter_probe, struct pt_regs *regs, long id)
+ 		type = g_syscall_table[table_index].enter_event_type;
+ #endif
+ 
+-		if (used)
+-			record_event(type, regs, id, drop_flags, NULL, NULL);
+-		else
+-			record_event(PPME_GENERIC_E, regs, id, UF_ALWAYS_DROP, NULL, NULL);
++		event_data.category = PPMC_SYSCALL;
++		event_data.event_info.syscall_data.regs = regs;
++		event_data.event_info.syscall_data.id = id;
++		if (used) {
++			record_event(type, drop_flags, &event_data);
++		} else {
++			record_event(PPME_GENERIC_E, UF_ALWAYS_DROP, &event_data);
++		}
+ 	}
+ }
+ 
+@@ -1083,6 +1167,7 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
+ 
+ 	table_index = id - SYSCALL_TABLE_ID0;
+ 	if (likely(table_index >= 0 && table_index < SYSCALL_TABLE_SIZE)) {
++		struct event_data_t event_data;
+ 		int used = g_syscall_table[table_index].flags & UF_USED;
+ 		enum syscall_flags drop_flags = g_syscall_table[table_index].flags;
+ 		enum ppm_event_type type;
+@@ -1098,10 +1183,14 @@ TRACEPOINT_PROBE(syscall_exit_probe, struct pt_regs *regs, long ret)
+ 		type = g_syscall_table[table_index].exit_event_type;
+ #endif
+ 
+-		if (used)
+-			record_event(type, regs, id, drop_flags, NULL, NULL);
+-		else
+-			record_event(PPME_GENERIC_X, regs, id, UF_ALWAYS_DROP, NULL, NULL);
++		event_data.category = PPMC_SYSCALL;
++		event_data.event_info.syscall_data.regs = regs;
++		event_data.event_info.syscall_data.id = id;
++		if (used) {
++			record_event(type, drop_flags, &event_data);
++		} else {
++			record_event(PPME_GENERIC_X, UF_ALWAYS_DROP, &event_data);
++		}
+ 	}
+ }
+ 
+@@ -1110,6 +1199,8 @@ int __access_remote_vm(struct task_struct *t, struct mm_struct *mm, unsigned lon
+ 
+ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ {
++	struct event_data_t event_data;
++
+ 	if (unlikely(current->flags & PF_KTHREAD)) {
+ 		/*
+ 		 * We are not interested in kernel threads
+@@ -1117,7 +1208,10 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ 		return;
+ 	}
+ 
+-	record_event(PPME_PROCEXIT_1_E, NULL, -1, UF_NEVER_DROP, p, p);
++	event_data.category = PPMC_CONTEXT_SWITCH;
++	event_data.event_info.context_data.sched_prev = p;
++	event_data.event_info.context_data.sched_next = p;
++	record_event(PPME_PROCEXIT_1_E, UF_NEVER_DROP, &event_data);
+ }
+ 
+ #include <linux/ip.h>
+@@ -1131,12 +1225,23 @@ TRACEPOINT_PROBE(sched_switch_probe, struct rq *rq, struct task_struct *prev, st
+ TRACEPOINT_PROBE(sched_switch_probe, struct task_struct *prev, struct task_struct *next)
+ #endif
+ {
+-	record_event(PPME_SCHEDSWITCH_6_E,
+-		NULL,
+-		-1,
+-		UF_USED,
+-		prev,
+-		next);
++	struct event_data_t event_data;
++	event_data.category = PPMC_CONTEXT_SWITCH;
++	event_data.event_info.context_data.sched_prev = prev;
++	event_data.event_info.context_data.sched_next = next;
++	record_event(PPME_SCHEDSWITCH_6_E, UF_USED, &event_data);
++}
++#endif
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_sigaction *ka)
++{
++	struct event_data_t event_data;
++	event_data.category = PPMC_SIGNAL;
++	event_data.event_info.signal_data.sig = sig;
++	event_data.event_info.signal_data.info = info;
++	event_data.event_info.signal_data.ka = ka;
++	record_event(PPME_SYSCALL_SIGNALDELIVER_E, UF_USED, &event_data);
+ }
+ #endif
+ 
+@@ -1236,6 +1341,10 @@ static void visit_tracepoint(struct tracepoint *tp, void *priv)
+ 	else if (!strcmp(tp->name, "sched_switch"))
+ 		tp_sched_switch = tp;
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	else if (!strcmp(tp->name, "signal_deliver"))
++		tp_signal_deliver = tp;
++#endif
+ }
+ 
+ static int get_tracepoint_handles(void)
+@@ -1260,6 +1369,12 @@ static int get_tracepoint_handles(void)
+ 		return -ENOENT;
+ 	}
+ #endif
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	if (!tp_signal_deliver) {
++		pr_err("failed to find signal_deliver tracepoint\n");
++		return -ENOENT;
++	}
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/driver/ppm.h b/driver/ppm.h
+index 0691c95..c66bf3b 100644
+--- a/driver/ppm.h
++++ b/driver/ppm.h
+@@ -29,6 +29,7 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+  * Global defines
+  */
+ #define CAPTURE_CONTEXT_SWITCHES
++#define CAPTURE_SIGNAL_DELIVERIES
+ #define RW_SNAPLEN 80
+ #define RW_SNAPLEN_EVENT 4096
+ #define RW_MAX_SNAPLEN (256 * 1024 * 1024)
+diff --git a/driver/ppm_events.h b/driver/ppm_events.h
+index d85778e..7f41d61 100644
+--- a/driver/ppm_events.h
++++ b/driver/ppm_events.h
+@@ -47,6 +47,9 @@ struct event_filler_arguments {
+ #endif
+ 	int fd; /* Passed by some of the fillers to val_to_ring to compute the snaplen dynamically */
+ 	bool enforce_snaplen;
++	int signo; /* Signal number */
++	__kernel_pid_t spid; /* PID of source process */
++	__kernel_pid_t dpid; /* PID of destination process */
+ };
+ 
+ /*
+diff --git a/driver/ppm_events_public.h b/driver/ppm_events_public.h
+index 7bde8a0..5025012 100644
+--- a/driver/ppm_events_public.h
++++ b/driver/ppm_events_public.h
+@@ -388,6 +388,16 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+ #define PPME_IS_EXIT(x) (x & PPME_DIRECTION_FLAG)
+ #define PPME_MAKE_ENTER(x) (x & (~1))
+ 
++/*
++ * Event category to classify events in generic categories
++ */
++enum ppm_capture_category {
++	PPMC_NONE = 0,
++	PPMC_SYSCALL = 1,
++	PPMC_CONTEXT_SWITCH = 2,
++	PPMC_SIGNAL = 3,
++};
++
+ /** @defgroup etypes Event Types
+  *  @{
+  */
+@@ -614,7 +624,9 @@ enum ppm_event_type {
+ 	PPME_SYSCALL_FORK_17_X = 219,
+ 	PPME_SYSCALL_VFORK_17_E = 220,
+ 	PPME_SYSCALL_VFORK_17_X = 221,
+-	PPM_EVENT_MAX = 222
++	PPME_SYSCALL_SIGNALDELIVER_E = 222,
++	PPME_SYSCALL_SIGNALDELIVER_X = 223, /* This should never be called */
++	PPM_EVENT_MAX = 224
+ };
+ /*@}*/
+ 
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index 10fd070..eb8db3e 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -119,6 +119,9 @@ static int f_sys_quotactl_e(struct event_filler_arguments *args);
+ static int f_sys_quotactl_x(struct event_filler_arguments *args);
+ static int f_sys_sysdigevent_e(struct event_filler_arguments *args);
+ static int f_sys_getresuid_and_gid_x(struct event_filler_arguments *args);
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static int f_sys_signaldeliver_e(struct event_filler_arguments *args);
++#endif
+ 
+ /*
+  * Note, this is not part of g_event_info because we want to share g_event_info with userland.
+@@ -321,6 +324,10 @@ const struct ppm_event_entry g_ppm_events[PPM_EVENT_MAX] = {
+ 	[PPME_SYSCALL_GETRESUID_X] = {f_sys_getresuid_and_gid_x},
+ 	[PPME_SYSCALL_GETRESGID_E] = {f_sys_empty},
+ 	[PPME_SYSCALL_GETRESGID_X] = {f_sys_getresuid_and_gid_x},
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++	[PPME_SYSCALL_SIGNALDELIVER_E] = {f_sys_signaldeliver_e},
++	[PPME_SYSCALL_SIGNALDELIVER_X] = {f_sys_empty},
++#endif
+ };
+ 
+ /*
+@@ -4130,3 +4137,33 @@ static int f_sys_getresuid_and_gid_x(struct event_filler_arguments *args)
+ 
+ 	return add_sentinel(args);
+ }
++
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++static int f_sys_signaldeliver_e(struct event_filler_arguments *args)
++{
++	int res;
++
++	/*
++	 * signal number
++	 */
++	res = val_to_ring(args, args->signo, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	/*
++	 * source pid
++	 */
++	res = val_to_ring(args, args->spid, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	/*
++	 * destination pid
++	 */
++	res = val_to_ring(args, args->dpid, 0, false, 0);
++	if (unlikely(res != PPM_SUCCESS))
++		return res;
++
++	return add_sentinel(args);
++}
++#endif
+diff --git a/userspace/libscap/event_table.c b/userspace/libscap/event_table.c
+index aad655e..2728c64 100644
+--- a/userspace/libscap/event_table.c
++++ b/userspace/libscap/event_table.c
+@@ -244,4 +244,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_SYSCALL_FORK_17_X */{"fork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
+ 	/* PPME_SYSCALL_VFORK_17_E */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_VFORK_17_X */{"vfork", EC_PROCESS, EF_MODIFIES_STATE, 17, {{"res", PT_PID, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_INT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"flags", PT_FLAGS32, PF_HEX, clone_flags}, {"uid", PT_UINT32, PF_DEC}, {"gid", PT_UINT32, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+
+From 0b06969c3c176349da17525009d250361b395c61 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sun, 15 Feb 2015 09:31:18 +0530
+Subject: [PATCH 08/18] Added userspace parser to retrieve signal_deliver trace
+ information from kernel.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/ppm_fillers.c           | 12 ++++++------
+ userspace/libsinsp/parsers.cpp | 20 ++++++++++++++++++++
+ userspace/libsinsp/parsers.h   |  1 +
+ 3 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index eb8db3e..0465ee7 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -4144,23 +4144,23 @@ static int f_sys_signaldeliver_e(struct event_filler_arguments *args)
+ 	int res;
+ 
+ 	/*
+-	 * signal number
++	 * source pid
+ 	 */
+-	res = val_to_ring(args, args->signo, 0, false, 0);
++	res = val_to_ring(args, args->spid, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+ 	/*
+-	 * source pid
++	 * destination pid
+ 	 */
+-	res = val_to_ring(args, args->spid, 0, false, 0);
++	res = val_to_ring(args, args->dpid, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+ 	/*
+-	 * destination pid
++	 * signal number
+ 	 */
+-	res = val_to_ring(args, args->dpid, 0, false, 0);
++	res = val_to_ring(args, args->signo, 0, false, 0);
+ 	if (unlikely(res != PPM_SUCCESS))
+ 		return res;
+ 
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index fb71e72..2e0b70c 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -298,6 +298,9 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 	case PPME_SYSCALL_SETGID_X:
+ 		parse_setgid_exit(evt);
+ 		break;
++	case PPME_SYSCALL_SIGNALDELIVER_E:
++		parse_signal_deliver(evt);
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -3181,3 +3184,20 @@ void sinsp_parser::parse_setgid_exit(sinsp_evt *evt)
+ 		evt->get_thread_info()->m_gid = new_egid;
+ 	}
+ }
++
++void sinsp_parser::parse_signal_deliver(sinsp_evt *evt)
++{
++	sinsp_evt_param *parinfo;
++
++	parinfo = evt->get_param(0);
++	ASSERT(parinfo->m_len == sizeof(uint64_t));
++	printf("spid: %lu   ", *(uint64_t *)parinfo->m_val);
++
++	parinfo = evt->get_param(1);
++	ASSERT(parinfo->m_len == sizeof(uint64_t));
++	printf("dpid: %lu   ", *(uint64_t *)parinfo->m_val);
++
++	parinfo = evt->get_param(2);
++	ASSERT(parinfo->m_len == sizeof(uint8_t));
++	printf("signal: %hhu\n", *(uint8_t *)parinfo->m_val);
++}
+diff --git a/userspace/libsinsp/parsers.h b/userspace/libsinsp/parsers.h
+index 21b521a..b6ae19b 100644
+--- a/userspace/libsinsp/parsers.h
++++ b/userspace/libsinsp/parsers.h
+@@ -102,6 +102,7 @@ class sinsp_parser
+ 	void parse_setresgid_exit(sinsp_evt* evt);
+ 	void parse_setuid_exit(sinsp_evt* evt);
+ 	void parse_setgid_exit(sinsp_evt* evt);
++	void parse_signal_deliver(sinsp_evt* evt);
+ 
+ 	inline void add_socket(sinsp_evt* evt, int64_t fd, uint32_t domain, uint32_t type, uint32_t protocol);
+ 	inline void add_pipe(sinsp_evt *evt, int64_t tid, int64_t fd, uint64_t ino);
+
+From 813730059aacb9f25b3182db918070fb28f94b04 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sun, 15 Feb 2015 10:55:23 +0530
+Subject: [PATCH 09/18] Removed userspace parser as no extra processing is
+ necessary in userspace. Removed redundant printfs from userspace.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ userspace/libsinsp/parsers.cpp | 18 ------------------
+ userspace/libsinsp/parsers.h   |  1 -
+ 2 files changed, 19 deletions(-)
+
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index 2e0b70c..639c62e 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -299,7 +299,6 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 		parse_setgid_exit(evt);
+ 		break;
+ 	case PPME_SYSCALL_SIGNALDELIVER_E:
+-		parse_signal_deliver(evt);
+ 		break;
+ 	default:
+ 		break;
+@@ -3184,20 +3183,3 @@ void sinsp_parser::parse_setgid_exit(sinsp_evt *evt)
+ 		evt->get_thread_info()->m_gid = new_egid;
+ 	}
+ }
+-
+-void sinsp_parser::parse_signal_deliver(sinsp_evt *evt)
+-{
+-	sinsp_evt_param *parinfo;
+-
+-	parinfo = evt->get_param(0);
+-	ASSERT(parinfo->m_len == sizeof(uint64_t));
+-	printf("spid: %lu   ", *(uint64_t *)parinfo->m_val);
+-
+-	parinfo = evt->get_param(1);
+-	ASSERT(parinfo->m_len == sizeof(uint64_t));
+-	printf("dpid: %lu   ", *(uint64_t *)parinfo->m_val);
+-
+-	parinfo = evt->get_param(2);
+-	ASSERT(parinfo->m_len == sizeof(uint8_t));
+-	printf("signal: %hhu\n", *(uint8_t *)parinfo->m_val);
+-}
+diff --git a/userspace/libsinsp/parsers.h b/userspace/libsinsp/parsers.h
+index b6ae19b..21b521a 100644
+--- a/userspace/libsinsp/parsers.h
++++ b/userspace/libsinsp/parsers.h
+@@ -102,7 +102,6 @@ class sinsp_parser
+ 	void parse_setresgid_exit(sinsp_evt* evt);
+ 	void parse_setuid_exit(sinsp_evt* evt);
+ 	void parse_setgid_exit(sinsp_evt* evt);
+-	void parse_signal_deliver(sinsp_evt* evt);
+ 
+ 	inline void add_socket(sinsp_evt* evt, int64_t fd, uint32_t domain, uint32_t type, uint32_t protocol);
+ 	inline void add_pipe(sinsp_evt *evt, int64_t tid, int64_t fd, uint64_t ino);
+
+From a1eb7f00b6d17ac42d59d24e3417c21aa4d63d42 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Thu, 19 Feb 2015 19:29:22 +0530
+Subject: [PATCH 10/18] Removing the case for PPME_SYSCALL_SIGNALDELIVER_E
+ parsing completely.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ userspace/libsinsp/parsers.cpp | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/userspace/libsinsp/parsers.cpp b/userspace/libsinsp/parsers.cpp
+index 639c62e..fb71e72 100644
+--- a/userspace/libsinsp/parsers.cpp
++++ b/userspace/libsinsp/parsers.cpp
+@@ -298,8 +298,6 @@ void sinsp_parser::process_event(sinsp_evt *evt)
+ 	case PPME_SYSCALL_SETGID_X:
+ 		parse_setgid_exit(evt);
+ 		break;
+-	case PPME_SYSCALL_SIGNALDELIVER_E:
+-		break;
+ 	default:
+ 		break;
+ 	}
+
+From 222ac2336ee2b98836c26855c95491e32adb5ec5 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Mon, 9 Mar 2015 21:32:11 +0530
+Subject: [PATCH 11/18] Fixed the order of clean-up in case of error in
+ registering signal_deliver_probe. The correct probe to unregister should be
+ sched_switch_probe.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/main.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/driver/main.c b/driver/main.c
+index 6231c37..bc1f519 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -307,6 +307,10 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 
+ 	goto cleanup_open;
+ 
++#ifdef CAPTURE_SIGNAL_DELIVERIES
++err_signal_deliver:
++	compat_unregister_trace(sched_switch_probe, "signal_switch", tp_signal_deliver);
++#endif
+ err_sched_switch:
+ 	compat_unregister_trace(syscall_procexit_probe, "sched_process_exit", tp_sched_process_exit);
+ err_sched_procexit:
+@@ -315,10 +319,6 @@ static int ppm_open(struct inode *inode, struct file *filp)
+ 	compat_unregister_trace(syscall_exit_probe, "sys_exit", tp_sys_exit);
+ err_sys_exit:
+ 	ring->open = false;
+-#ifdef CAPTURE_SIGNAL_DELIVERIES
+-err_signal_deliver:
+-	compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
+-#endif
+ cleanup_open:
+ 	mutex_unlock(&g_open_mutex);
+ 
+
+From b0e3f62b6d6f51563003e6bc0b1ef7b87a98f278 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Mon, 9 Mar 2015 23:09:45 +0530
+Subject: [PATCH 12/18] signal_deliver probe should be enabed if kernel version
+ is greater than 2.6.32 Reason: signal_deliver tracepoint was introduced in
+ mainline kernel version 2.6.33
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/ppm.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/driver/ppm.h b/driver/ppm.h
+index c66bf3b..ce7720e 100644
+--- a/driver/ppm.h
++++ b/driver/ppm.h
+@@ -16,6 +16,8 @@ You should have received a copy of the GNU General Public License
+ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
++#include<linux/version.h>
++
+ /*
+  * Our Own ASSERT implementation, so we can easily switch among BUG_ON, WARN_ON and nothing
+  */
+@@ -29,7 +31,9 @@ along with sysdig.  If not, see <http://www.gnu.org/licenses/>.
+  * Global defines
+  */
+ #define CAPTURE_CONTEXT_SWITCHES
++#if (LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 32))
+ #define CAPTURE_SIGNAL_DELIVERIES
++#endif
+ #define RW_SNAPLEN 80
+ #define RW_SNAPLEN_EVENT 4096
+ #define RW_MAX_SNAPLEN (256 * 1024 * 1024)
+
+From 2239f6751f25b772bd8f968d84b77fd3bb3e99f7 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Tue, 10 Mar 2015 18:39:33 +0530
+Subject: [PATCH 13/18] Add correct signature after merge.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/main.c | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/driver/main.c b/driver/main.c
+index 39ec128..0d9db50 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -1036,11 +1036,8 @@ static inline int drop_event(struct ppm_consumer_t *consumer, enum ppm_event_typ
+ }
+ 
+ static void record_event_all_consumers(enum ppm_event_type event_type,
+-	struct pt_regs *regs,
+-	long id,
+ 	enum syscall_flags drop_flags,
+-	struct task_struct *sched_prev,
+-	struct task_struct *sched_next)
++	struct event_data_t *event_datap)
+ {
+ 	struct ppm_consumer_t *consumer;
+ 	struct timespec ts;
+@@ -1049,7 +1046,7 @@ static void record_event_all_consumers(enum ppm_event_type event_type,
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(consumer, &g_consumer_list, node) {
+-		record_event_consumer(consumer, event_type, regs, id, drop_flags, sched_prev, sched_next, &ts);
++		record_event_consumer(consumer, event_type, drop_flags, &ts, event_datap);
+ 	}
+ 	rcu_read_unlock();
+ }
+
+From db8114ee4c4f02c184efd970f6585afd96a3eccf Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Tue, 10 Mar 2015 18:47:09 +0530
+Subject: [PATCH 14/18] Added newlines to maks the calls uniform.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/main.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/driver/main.c b/driver/main.c
+index 0d9db50..2922684 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -564,6 +564,7 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		event_data.category = PPMC_CONTEXT_SWITCH;
+ 		event_data.event_info.context_data.sched_prev = (void *)DEI_DISABLE_DROPPING;
+ 		event_data.event_info.context_data.sched_next = (void *)0;
++
+ 		record_event_consumer(consumer, PPME_SYSDIGEVENT_E, UF_NEVER_DROP, &ts, &event_data);
+ 
+ 		ret = 0;
+@@ -1452,6 +1453,7 @@ TRACEPOINT_PROBE(syscall_procexit_probe, struct task_struct *p)
+ 	event_data.category = PPMC_CONTEXT_SWITCH;
+ 	event_data.event_info.context_data.sched_prev = p;
+ 	event_data.event_info.context_data.sched_next = p;
++
+ 	record_event_all_consumers(PPME_PROCEXIT_1_E, UF_NEVER_DROP, &event_data);
+ }
+ 
+
+From 8f82a6597ce3f6bfe241d0f81598bfc64af7cfcc Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Tue, 10 Mar 2015 21:30:04 +0530
+Subject: [PATCH 15/18] IOCTLs to enable/disable the signal_deliver tracepoint
+ The ioctls use the global variable g_tracepoint_registered which is true only
+ if a device is open. The rationale is: signal_deliver tracepoint toggling
+ should only be allowed if at least the last /dev/sysdig* device is in open
+ state.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/main.c              | 14 ++++++++++++++
+ driver/ppm_events_public.h |  2 ++
+ 2 files changed, 16 insertions(+)
+
+diff --git a/driver/main.c b/driver/main.c
+index 2922684..d9a2d2f 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -722,6 +722,20 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 	case PPM_IOCTL_GET_CURRENT_PID:
+ 		ret = task_tgid_nr(current);
+ 		goto cleanup_ioctl;
++	case PPM_IOCTL_DISABLE_SIGNAL_DELIVER:
++	{
++		vpr_info("PPM_IOCTL_DISABLE_SIGNAL_DELIVER\n");
++		if (g_tracepoint_registered) 
++			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++		return 0;
++	}
++	case PPM_IOCTL_ENABLE_SIGNAL_DELIVER:
++	{
++		vpr_info("PPM_IOCTL_ENABLE_SIGNAL_DELIVER\n");
++		if (g_tracepoint_registered)
++			compat_register_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
++		return 0;
++	}
+ 	default:
+ 		ret = -ENOTTY;
+ 		goto cleanup_ioctl;
+diff --git a/driver/ppm_events_public.h b/driver/ppm_events_public.h
+index d3efef3..3aee147 100644
+--- a/driver/ppm_events_public.h
++++ b/driver/ppm_events_public.h
+@@ -1138,6 +1138,8 @@ struct ppm_evt_hdr {
+ #define PPM_IOCTL_GET_VPID _IO(PPM_IOCTL_MAGIC, 11)
+ #define PPM_IOCTL_GET_CURRENT_TID _IO(PPM_IOCTL_MAGIC, 12)
+ #define PPM_IOCTL_GET_CURRENT_PID _IO(PPM_IOCTL_MAGIC, 13)
++#define PPM_IOCTL_DISABLE_SIGNAL_DELIVER _IO(PPM_IOCTL_MAGIC, 14)
++#define PPM_IOCTL_ENABLE_SIGNAL_DELIVER _IO(PPM_IOCTL_MAGIC, 15)
+ 
+ /*!
+   \brief System call description struct.
+
+From 017f02e1d292633cb9994f5114cc2b2a25d51a4c Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Tue, 10 Mar 2015 22:15:41 +0530
+Subject: [PATCH 16/18] Must unlock mutex before retruning from ioctl handlers.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/main.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/driver/main.c b/driver/main.c
+index d9a2d2f..81ae70f 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -727,14 +727,16 @@ static long ppm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+ 		vpr_info("PPM_IOCTL_DISABLE_SIGNAL_DELIVER\n");
+ 		if (g_tracepoint_registered) 
+ 			compat_unregister_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
+-		return 0;
++		ret = 0;
++		goto cleanup_ioctl;
+ 	}
+ 	case PPM_IOCTL_ENABLE_SIGNAL_DELIVER:
+ 	{
+ 		vpr_info("PPM_IOCTL_ENABLE_SIGNAL_DELIVER\n");
+ 		if (g_tracepoint_registered)
+ 			compat_register_trace(signal_deliver_probe, "signal_deliver", tp_signal_deliver);
+-		return 0;
++		ret = 0;
++		goto cleanup_ioctl;
+ 	}
+ 	default:
+ 		ret = -ENOTTY;
+
+From 3a3369193c9dc1d1048e588a0296869d0125607c Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sat, 14 Mar 2015 02:11:43 +0530
+Subject: [PATCH 17/18] Capture source process ID for various signals.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/main.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/driver/main.c b/driver/main.c
+index 81ae70f..1b016dd 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -1237,12 +1237,20 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
+ 
+ 		if (event_datap->category == PPMC_SIGNAL) {
+ 			args.signo = event_datap->event_info.signal_data.sig;
+-			if (event_datap->event_info.signal_data.info->si_signo == __SI_KILL) {
++
++			if (args.signo == SIGKILL) {
+ 				args.spid = event_datap->event_info.signal_data.info->_sifields._kill._pid;
+-			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_RT) {
+-				args.spid = event_datap->event_info.signal_data.info->_sifields._rt._pid;
+-			} else if (event_datap->event_info.signal_data.info->si_signo == __SI_CHLD) {
++			} else if (args.signo == SIGTERM || args.signo == SIGHUP || args.signo == SIGINT ||
++					args.signo == SIGTSTP || args.signo == SIGQUIT) {
++				if (event_datap->event_info.signal_data.info->si_code == SI_USER ||
++						event_datap->event_info.signal_data.info->si_code == SI_QUEUE ||
++						event_datap->event_info.signal_data.info->si_code <= 0) {
++					args.spid = event_datap->event_info.signal_data.info->si_pid;
++				}
++			} else if (args.signo == SIGCHLD) {
+ 				args.spid = event_datap->event_info.signal_data.info->_sifields._sigchld._pid;
++			} else if (args.signo >= SIGRTMIN && args.signo <= SIGRTMAX) {
++				args.spid = event_datap->event_info.signal_data.info->_sifields._rt._pid;
+ 			} else {
+ 				args.spid = (__kernel_pid_t) 0;
+ 			}
+
+From f0c96b8d2b4aa84600405aa9f7037f90d14a5fd8 Mon Sep 17 00:00:00 2001
+From: Arun Prakash Jana <engineerarun@gmail.com>
+Date: Sat, 14 Mar 2015 02:25:23 +0530
+Subject: [PATCH 18/18] Removed "SYSCALL" from PPME_SYSCALL_SIGNALDELIVER_E &
+ PPME_SYSCALL_SIGNALDELIVER_X.
+
+Signed-off-by: Arun Prakash Jana <engineerarun@gmail.com>
+---
+ driver/event_table.c            | 4 ++--
+ driver/main.c                   | 4 ++--
+ driver/ppm_events_public.h      | 4 ++--
+ driver/ppm_fillers.c            | 4 ++--
+ userspace/libscap/event_table.c | 4 ++--
+ 5 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/driver/event_table.c b/driver/event_table.c
+index 2a6cbb6..f14842c 100644
+--- a/driver/event_table.c
++++ b/driver/event_table.c
+@@ -254,6 +254,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_CONTAINER_X */{"container", EC_INTERNAL, EF_UNUSED, 0},
+ 	/* PPME_SYSCALL_EXECVE_16_E */{"execve", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_EXECVE_16_X */{"execve", EC_PROCESS, EF_MODIFIES_STATE, 16, {{"res", PT_ERRNO, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_UINT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"cgroups", PT_BYTEBUF, PF_NA}, {"env", PT_BYTEBUF, PF_NA} } },
+-	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
+-	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
++	/* PPME_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };
+diff --git a/driver/main.c b/driver/main.c
+index 1b016dd..f21deb9 100644
+--- a/driver/main.c
++++ b/driver/main.c
+@@ -1124,7 +1124,7 @@ static int record_event_consumer(struct ppm_consumer_t *consumer,
+ 			ring_info->n_context_switches++;
+ 		}
+ 	} else if (event_datap->category == PPMC_SIGNAL) {
+-		if (event_type == PPME_SYSCALL_SIGNALDELIVER_E) {
++		if (event_type == PPME_SIGNALDELIVER_E) {
+ 			ASSERT(event_datap->event_info.signal_data.info != NULL);
+ 		}
+ 	}
+@@ -1510,7 +1510,7 @@ TRACEPOINT_PROBE(signal_deliver_probe, int sig, struct siginfo *info, struct k_s
+ 	event_data.event_info.signal_data.info = info;
+ 	event_data.event_info.signal_data.ka = ka;
+ 
+-	record_event_all_consumers(PPME_SYSCALL_SIGNALDELIVER_E, UF_USED, &event_data);
++	record_event_all_consumers(PPME_SIGNALDELIVER_E, UF_USED, &event_data);
+ }
+ #endif
+ 
+diff --git a/driver/ppm_events_public.h b/driver/ppm_events_public.h
+index 3aee147..6f6169a 100644
+--- a/driver/ppm_events_public.h
++++ b/driver/ppm_events_public.h
+@@ -634,8 +634,8 @@ enum ppm_event_type {
+ 	PPME_CONTAINER_X = 229,
+ 	PPME_SYSCALL_EXECVE_16_E = 230,
+ 	PPME_SYSCALL_EXECVE_16_X = 231,
+-	PPME_SYSCALL_SIGNALDELIVER_E = 232,
+-	PPME_SYSCALL_SIGNALDELIVER_X = 233, /* This should never be called */
++	PPME_SIGNALDELIVER_E = 232,
++	PPME_SIGNALDELIVER_X = 233, /* This should never be called */
+ 	PPM_EVENT_MAX = 234
+ };
+ /*@}*/
+diff --git a/driver/ppm_fillers.c b/driver/ppm_fillers.c
+index d648d36..a9bed1c 100644
+--- a/driver/ppm_fillers.c
++++ b/driver/ppm_fillers.c
+@@ -326,8 +326,8 @@ const struct ppm_event_entry g_ppm_events[PPM_EVENT_MAX] = {
+ 	[PPME_SYSCALL_GETRESGID_E] = {f_sys_empty},
+ 	[PPME_SYSCALL_GETRESGID_X] = {f_sys_getresuid_and_gid_x},
+ #ifdef CAPTURE_SIGNAL_DELIVERIES
+-	[PPME_SYSCALL_SIGNALDELIVER_E] = {f_sys_signaldeliver_e},
+-	[PPME_SYSCALL_SIGNALDELIVER_X] = {f_sys_empty},
++	[PPME_SIGNALDELIVER_E] = {f_sys_signaldeliver_e},
++	[PPME_SIGNALDELIVER_X] = {f_sys_empty},
+ #endif
+ };
+ 
+diff --git a/userspace/libscap/event_table.c b/userspace/libscap/event_table.c
+index 0c4317d..0e26587 100644
+--- a/userspace/libscap/event_table.c
++++ b/userspace/libscap/event_table.c
+@@ -254,6 +254,6 @@ const struct ppm_event_info g_event_info[PPM_EVENT_MAX] = {
+ 	/* PPME_CONTAINER_X */{"container", EC_INTERNAL, EF_UNUSED, 0},
+ 	/* PPME_SYSCALL_EXECVE_16_E */{"execve", EC_PROCESS, EF_MODIFIES_STATE, 0},
+ 	/* PPME_SYSCALL_EXECVE_16_X */{"execve", EC_PROCESS, EF_MODIFIES_STATE, 16, {{"res", PT_ERRNO, PF_DEC}, {"exe", PT_CHARBUF, PF_NA}, {"args", PT_BYTEBUF, PF_NA}, {"tid", PT_PID, PF_DEC}, {"pid", PT_PID, PF_DEC}, {"ptid", PT_PID, PF_DEC}, {"cwd", PT_CHARBUF, PF_NA}, {"fdlimit", PT_UINT64, PF_DEC}, {"pgft_maj", PT_UINT64, PF_DEC}, {"pgft_min", PT_UINT64, PF_DEC}, {"vm_size", PT_UINT32, PF_DEC}, {"vm_rss", PT_UINT32, PF_DEC}, {"vm_swap", PT_UINT32, PF_DEC}, {"comm", PT_CHARBUF, PF_NA}, {"cgroups", PT_BYTEBUF, PF_NA}, {"env", PT_BYTEBUF, PF_NA} } },
+-	/* PPME_SYSCALL_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
+-	/* PPME_SYSCALL_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
++	/* PPME_SIGNALDELIVER_E */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 3, {{"spid", PT_PID, PF_DEC}, {"dpid", PT_PID, PF_DEC}, {"sig", PT_SIGTYPE, PF_DEC} } },
++	/* PPME_SIGNALDELIVER_X */ {"signaldeliver", EC_SIGNAL, EF_MODIFIES_STATE, 0 },
+ };

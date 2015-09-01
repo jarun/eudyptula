@@ -1,0 +1,24 @@
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ make
+make -C /lib/modules/3.15.0-031500rc5-generic/build M=/home/arun/DEVEL/Eudyptula/Task_01 modules
+make[1]: Entering directory `/usr/src/linux-headers-3.15.0-031500rc5-generic'
+  CC [M]  /home/arun/DEVEL/Eudyptula/Task_01/hellokernel.o
+  Building modules, stage 2.
+  MODPOST 1 modules
+  CC      /home/arun/DEVEL/Eudyptula/Task_01/hellokernel.mod.o
+  LD [M]  /home/arun/DEVEL/Eudyptula/Task_01/hellokernel.ko
+make[1]: Leaving directory `/usr/src/linux-headers-3.15.0-031500rc5-generic'
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ uname -r
+3.15.0-031500rc5-generic
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ modinfo hellokernel.ko
+filename:       /home/arun/DEVEL/Eudyptula/Task_01/hellokernel.ko
+srcversion:     B80F5991B0D2129E66C5F92
+depends:        
+vermagic:       3.15.0-031500rc5-generic SMP mod_unload modversions 
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ sudo insmod hellokernel.ko
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ sudo dmesg
+[ 9996.091833] Hello World!
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ lsmod|grep hellokernel
+hellokernel            12390  0 
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ sudo rmmod hellokernel.ko
+arun@Tux:~/DEVEL/Eudyptula/Task_01$ lsmod|grep hellokernel
+arun@Tux:~/DEVEL/Eudyptula/Task_01$

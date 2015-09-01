@@ -1,0 +1,7 @@
+1. https://www.kernel.org/doc/man-pages/linux-next.html
+2. https://github.com/vincentbernat/eudyptula-boot
+3. http://blog.elastocloud.org/2015/06/rapid-linux-kernel-devtest-with-qemu.html
+NOTE: Instead of
+~/linux/> qemu-kvm -kernel arch/x86/boot/bzImage \
+use:
+~/linux/> kvm -kernel arch/x86/boot/bzImage \

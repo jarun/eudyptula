@@ -1,0 +1,64 @@
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ uname -r
+4.0.0
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ make clean;make
+make -C /usr/src/linux M=/home/arun/DEVEL/Eudyptula/Task_05 clean
+make[1]: Entering directory `/usr/src/linux'
+  CLEAN   /home/arun/DEVEL/Eudyptula/Task_05/.tmp_versions
+  CLEAN   /home/arun/DEVEL/Eudyptula/Task_05/Module.symvers
+make[1]: Leaving directory `/usr/src/linux'
+make -C /usr/src/linux M=/home/arun/DEVEL/Eudyptula/Task_05 modules
+make[1]: Entering directory `/usr/src/linux'
+  CC [M]  /home/arun/DEVEL/Eudyptula/Task_05/kbd_driver.o
+  Building modules, stage 2.
+  MODPOST 1 modules
+  CC      /home/arun/DEVEL/Eudyptula/Task_05/kbd_driver.mod.o
+  LD [M]  /home/arun/DEVEL/Eudyptula/Task_05/kbd_driver.ko
+make[1]: Leaving directory `/usr/src/linux'
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ sudo cp kbd_driver.ko /lib/modules/4.0.0/
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ sudo depmod -a
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ tail -5 /lib/modules/4.0.0/modules.alias
+alias net-pf-16-proto-16-family-nl80211 cfg80211
+alias net-pf-31 bluetooth
+alias bt-proto-3 rfcomm
+alias bt-proto-4 bnep
+alias usb:v413Cp2011d*dc*dsc*dp*ic*isc*ip*in* kbd_driver
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ tail -5 /lib/modules/4.0.0/modules.dep
+kernel/net/bluetooth/bluetooth.ko:
+kernel/net/bluetooth/rfcomm/rfcomm.ko: kernel/net/bluetooth/bluetooth.ko
+kernel/net/bluetooth/bnep/bnep.ko: kernel/net/bluetooth/bluetooth.ko
+kernel/net/mac80211/mac80211.ko: kernel/net/wireless/cfg80211.ko
+kbd_driver.ko:
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ sudo dmesg -C
+arun@Tux:~/DEVEL/Eudyptula/Task_05$ dmesg
+[ 3107.277735] usb 1-1: USB disconnect, device number 11
+[ 3109.316934] usb 1-1: new low-speed USB device number 14 using xhci_hcd
+[ 3109.449118] usb 1-1: New USB device found, idVendor=0461, idProduct=4e22
+[ 3109.449125] usb 1-1: New USB device strings: Mfr=1, Product=2, SerialNumber=0
+[ 3109.449128] usb 1-1: Product: USB Optical Mouse
+[ 3109.449131] usb 1-1: Manufacturer: PixArt
+[ 3109.449398] usb 1-1: ep 0x81 - rounding interval to 64 microframes, ep desc says 80 microframes
+[ 3109.451825] input: PixArt USB Optical Mouse as /devices/pci0000:00/0000:00:14.0/usb1/1-1/1-1:1.0/0003:0461:4E22.000D/input/input24
+[ 3109.452279] hid-generic 0003:0461:4E22.000D: input,hidraw0: USB HID v1.11 Mouse [PixArt USB Optical Mouse] on usb-0000:00:14.0-1/input0
+[ 3111.312713] usb 1-2: USB disconnect, device number 12
+[ 3111.312720] usb 1-2.1: USB disconnect, device number 13
+[ 3114.787157] usb 1-2: new full-speed USB device number 15 using xhci_hcd
+[ 3114.916272] usb 1-2: New USB device found, idVendor=413c, idProduct=1005
+[ 3114.916279] usb 1-2: New USB device strings: Mfr=1, Product=2, SerialNumber=0
+[ 3114.916282] usb 1-2: Product: Dell Multimedia Pro Keyboard Hub
+[ 3114.916285] usb 1-2: Manufacturer: Dell
+[ 3114.916570] usb 1-2: ep 0x81 - rounding interval to 128 microframes, ep desc says 192 microframes
+[ 3114.917461] hub 1-2:1.0: USB hub found
+[ 3114.917573] hub 1-2:1.0: 3 ports detected
+[ 3115.187694] usb 1-2.1: new low-speed USB device number 16 using xhci_hcd
+[ 3115.281795] usb 1-2.1: New USB device found, idVendor=413c, idProduct=2011
+[ 3115.281800] usb 1-2.1: New USB device strings: Mfr=1, Product=2, SerialNumber=0
+[ 3115.281804] usb 1-2.1: Product: Dell Multimedia Pro Keyboard
+[ 3115.281806] usb 1-2.1: Manufacturer: Dell
+[ 3115.282081] usb 1-2.1: ep 0x81 - rounding interval to 64 microframes, ep desc says 80 microframes
+[ 3115.282088] usb 1-2.1: ep 0x82 - rounding interval to 1024 microframes, ep desc says 2040 microframes
+[ 3115.288150] input: Dell Dell Multimedia Pro Keyboard as /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.1/1-2.1:1.0/0003:413C:2011.000E/input/input25
+[ 3115.344057] hid-generic 0003:413C:2011.000E: input,hidraw1: USB HID v1.10 Keyboard [Dell Dell Multimedia Pro Keyboard] on usb-0000:00:14.0-2.1/input0
+[ 3115.351986] input: Dell Dell Multimedia Pro Keyboard as /devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.1/1-2.1:1.1/0003:413C:2011.000F/input/input26
+[ 3115.408373] hid-generic 0003:413C:2011.000F: input,hidraw2: USB HID v1.10 Device [Dell Dell Multimedia Pro Keyboard] on usb-0000:00:14.0-2.1/input1
+[ 3115.423592] kbd_init called.
+arun@Tux:~/DEVEL/Eudyptula/Task_05$

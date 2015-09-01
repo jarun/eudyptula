@@ -1,0 +1,48 @@
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/usb.h>
+
+MODULE_LICENSE("GPL");
+
+static struct usb_device_id kbd_table[] =
+{
+	{ USB_DEVICE(0x413C, 0x2011) },
+	{}
+};
+
+MODULE_DEVICE_TABLE (usb, kbd_table);
+
+static int kbd_probe(struct usb_interface *interface, const struct usb_device_id *id)
+{
+	printk(KERN_INFO "USB keyboard (%04X:%04X) plugged\n", id->idVendor, id->idProduct);
+	return 0;
+}
+
+static void kbd_disconnect(struct usb_interface *interface)
+{
+	printk(KERN_INFO "USB keyboard removed\n");
+}
+
+static struct usb_driver kbd_driver =
+{
+	.name = "kbd_driver",
+	.id_table = kbd_table,
+	.probe = kbd_probe,
+	.disconnect = kbd_disconnect,
+};
+
+static int __init kbd_init(void)
+{
+	return usb_register(&kbd_driver);
+	return 0;
+}
+
+static void __exit kbd_exit(void)
+{
+	usb_deregister(&kbd_driver);
+	return;
+}
+
+module_init(kbd_init);
+module_exit(kbd_exit);
