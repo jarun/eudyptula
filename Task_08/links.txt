@@ -1,0 +1,22 @@
+https://www.kernel.org/doc/Documentation/filesystems/debugfs.txt
+
+https://burzalodowa.wordpress.com/2013/10/05/how-to-send-patches-with-git-send-email/
+http://morefedora.blogspot.ru/2009/02/configuring-git-send-email-to-use-gmail.html
+http://www.freedesktop.org/wiki/Software/PulseAudio/HowToUseGitSendEmail/
+
+http://stackoverflow.com/questions/7885075/format-patch-for-a-single-file
+http://stackoverflow.com/questions/11991955/generate-patch-file-from-git-project-without-commit
+
+Jiffies
+-------
+http://www.makelinux.net/books/lkd2/ch10lev1sec3
+
+Steps
+-----
+1. git add -A Task_08
+2. git commit -a -s
+3. git format-patch -1 -o patch_1/
+4. Edit the subject in patch_1/0001-Add-files-for-Task_08.patch to "[a02f63f544ea] Task 08 results"
+5. git send-email --chain-reply-to --subject="[a02f63f544ea] Task 08 results" --to little@eudyptula-challenge.org patch_1/*
+
+6. git format-patch -o patch_1/ -2 f37e380
